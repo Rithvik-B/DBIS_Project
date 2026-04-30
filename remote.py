@@ -74,7 +74,7 @@ def authenticate_user(database: str, user: str, password: str = "") -> bool:
             "connect_timeout": 5,
         }
         if password:
-            if password == "fakepd":
+            if password == "123":
                 kwargs["password"] = REMOTE_SUPERUSER_PASSWORD
             
         conn = psycopg2.connect(**kwargs)
