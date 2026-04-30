@@ -65,14 +65,17 @@ def authenticate_user(database: str, user: str, password: str = "") -> bool:
     For Phase 1 we allow passwordless logins (trust auth) — tighten later.
     """
     try:
-        conn = psycopg2.connect(
-            host=REMOTE_HOST,
-            port=REMOTE_PORT,
-            dbname=database,
-            user=user,
-            password=password,
-            connect_timeout=5,
-        )
+        kwargs = {
+            "host": REMOTE_HOST,
+            "port": REMOTE_PORT,
+            "dbname": database,
+            "user": user,
+            "connect_timeout": 5,
+        }
+        if password:
+            kwargs["password"] = password
+            
+        conn = psycopg2.connect(**kwargs)
         conn.close()
         return True
     except psycopg2.OperationalError as e:

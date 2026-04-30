@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import uuid
+import getpass
 
 import query as qmod   # our query.py
 
@@ -76,6 +77,10 @@ async def do_connect(
     database = parsed.params["database"]
     user     = parsed.params["user"]
     password = parsed.params["password"]
+
+    if not password:
+        loop = asyncio.get_event_loop()
+        password = await loop.run_in_executor(None, getpass.getpass, f"Password for user {user}: ")
 
     print(f"\n[proxy] → Sending CONNECT to remote.py …")
     await send_msg(remote_writer, {
