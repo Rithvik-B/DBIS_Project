@@ -16,6 +16,7 @@ Phase 1 flow:
 
 import asyncio
 import json
+import os
 import uuid
 
 import query as qmod   # our query.py
@@ -23,10 +24,24 @@ import query as qmod   # our query.py
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-REMOTE_HOST = "localhost"
-REMOTE_PORT = 5000
-CLIENT_HOST = "localhost"
-CLIENT_PORT = 5001
+CONFIG_FILE = "proxy_config.json"
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+else:
+    config = {
+        "remote_host": "192.168.1.100",  # IP address of the remote laptop
+        "remote_port": 5000,
+        "client_host": "localhost",
+        "client_port": 5001
+    }
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+REMOTE_HOST = config.get("remote_host", "192.168.1.100")
+REMOTE_PORT = config.get("remote_port", 5000)
+CLIENT_HOST = config.get("client_host", "localhost")
+CLIENT_PORT = config.get("client_port", 5001)
 
 CLIENT_ID = f"proxy-{uuid.uuid4().hex[:8]}"
 

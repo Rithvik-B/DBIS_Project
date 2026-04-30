@@ -10,17 +10,34 @@ Responsibilities (Phase 1):
 
 import asyncio
 import json
+import os
 import psycopg2
 import psycopg2.extras
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-LOCAL_HOST     = "localhost"
-LOCAL_PORT     = 5432          # local Postgres (could be a different port, e.g. 5433)
-LOCAL_SUPERUSER          = "postgres"
-LOCAL_SUPERUSER_PASSWORD = "postgres"
-LISTEN_HOST = "localhost"
-LISTEN_PORT = 5001
+CONFIG_FILE = "client_config.json"
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+else:
+    config = {
+        "local_db_host": "localhost",
+        "local_db_port": 5432,
+        "local_superuser": "postgres",
+        "local_superuser_password": "postgres",
+        "listen_host": "localhost",
+        "listen_port": 5001
+    }
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+LOCAL_HOST = config.get("local_db_host", "localhost")
+LOCAL_PORT = config.get("local_db_port", 5432)
+LOCAL_SUPERUSER = config.get("local_superuser", "postgres")
+LOCAL_SUPERUSER_PASSWORD = config.get("local_superuser_password", "postgres")
+LISTEN_HOST = config.get("listen_host", "localhost")
+LISTEN_PORT = config.get("listen_port", 5001)
 
 # ─── Global State ─────────────────────────────────────────────────────────────
 

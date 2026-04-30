@@ -1,0 +1,8 @@
+{
+    "local_db_host": "localhost",
+    "local_db_port": 5432,
+    "local_superuser": "postgres",
+    "local_superuser_password": "postgres",
+    "listen_host": "localhost",
+    "listen_port": 5001
+}

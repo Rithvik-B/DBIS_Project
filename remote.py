@@ -10,17 +10,34 @@ Responsibilities (Phase 1):
 
 import asyncio
 import json
+import os
 import psycopg2
 import psycopg2.extras
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-REMOTE_HOST = "localhost"
-REMOTE_PORT = 5432
-REMOTE_SUPERUSER = "postgres"          # superuser to inspect schema / grants
-REMOTE_SUPERUSER_PASSWORD = "postgres"
-LISTEN_HOST = "localhost"
-LISTEN_PORT = 5000
+CONFIG_FILE = "remote_config.json"
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r") as f:
+        config = json.load(f)
+else:
+    config = {
+        "remote_db_host": "localhost",
+        "remote_db_port": 5432,
+        "remote_superuser": "postgres",
+        "remote_superuser_password": "postgres",
+        "listen_host": "0.0.0.0",
+        "listen_port": 5000
+    }
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f, indent=4)
+
+REMOTE_HOST = config.get("remote_db_host", "localhost")
+REMOTE_PORT = config.get("remote_db_port", 5432)
+REMOTE_SUPERUSER = config.get("remote_superuser", "postgres")
+REMOTE_SUPERUSER_PASSWORD = config.get("remote_superuser_password", "postgres")
+LISTEN_HOST = config.get("listen_host", "0.0.0.0")
+LISTEN_PORT = config.get("listen_port", 5000)
 
 # ─── Global State ─────────────────────────────────────────────────────────────
 
