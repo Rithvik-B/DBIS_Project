@@ -2,22 +2,9 @@
 client.py — Client Brain
 ========================
 Listens on port 5001. Sits in front of the local PostgreSQL instance.
-<<<<<<< HEAD
 
 Phase 1: INIT_DB — create local database, replicate schema, apply permissions.
 Phase 2: CACHE_ROWS, CACHE_CHECK, WRITE_LOCAL, RECALL_LOCK, CACHE_INVALIDATE.
-=======
-<<<<<<< HEAD
-Responsibilities (Phase 1):
-  - Accept proxy connections and handshakes
-  - Handle INIT_DB: create local database, recreate schema, apply permissions
-  - Track schema registry and local state
-=======
-
-Phase 1: INIT_DB — create local database, replicate schema, apply permissions.
-Phase 2: CACHE_ROWS, CACHE_CHECK, WRITE_LOCAL, RECALL_LOCK, CACHE_INVALIDATE.
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 """
 
 import asyncio
@@ -44,24 +31,6 @@ else:
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-LOCAL_HOST = config.get("local_db_host", "localhost")
-LOCAL_PORT = config.get("local_db_port", 5432)
-LOCAL_SUPERUSER = config.get("local_superuser", "postgres")
-LOCAL_SUPERUSER_PASSWORD = config.get("local_superuser_password", "postgres")
-LISTEN_HOST = config.get("listen_host", "localhost")
-LISTEN_PORT = config.get("listen_port", 5001)
-
-# ─── Global State ─────────────────────────────────────────────────────────────
-
-local_cache_index: dict = {}   # table → set of cached row PKs
-local_locks:       dict = {}   # row_id → lock_info
-schema_registry:   dict = {}   # database → schema dict
-
-=======
->>>>>>> 130b6a3 (phase-2)
 LOCAL_HOST               = config.get("local_db_host", "localhost")
 LOCAL_PORT               = config.get("local_db_port", 5432)
 LOCAL_SUPERUSER          = config.get("local_superuser", "postgres")
@@ -85,32 +54,14 @@ pending_changes: list = []
 # fingerprint → {"table": str, "pks": list, "database": str, "pk_cols": list}
 query_cache: dict = {}
 
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
 # ─── Low-level DB helpers ─────────────────────────────────────────────────────
 
 def get_superuser_conn(database: str = "postgres", autocommit: bool = False):
     conn = psycopg2.connect(
-<<<<<<< HEAD
         host=LOCAL_HOST, port=LOCAL_PORT,
         dbname=database,
         user=LOCAL_SUPERUSER, password=LOCAL_SUPERUSER_PASSWORD,
-=======
-<<<<<<< HEAD
-        host=LOCAL_HOST,
-        port=LOCAL_PORT,
-        dbname=database,
-        user=LOCAL_SUPERUSER,
-        password=LOCAL_SUPERUSER_PASSWORD,
-=======
-        host=LOCAL_HOST, port=LOCAL_PORT,
-        dbname=database,
-        user=LOCAL_SUPERUSER, password=LOCAL_SUPERUSER_PASSWORD,
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     )
     conn.autocommit = autocommit
     return conn
@@ -149,13 +100,6 @@ def user_exists_locally(user: str) -> bool:
 
 
 def ensure_local_user(user: str):
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    """Create the role locally if it doesn't exist (no password needed for local trust auth)."""
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     if user_exists_locally(user):
         return
     conn = get_superuser_conn(autocommit=True)
@@ -169,28 +113,12 @@ def ensure_local_user(user: str):
 # ─── Schema Replication ───────────────────────────────────────────────────────
 
 def col_definition(col: dict) -> str:
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    """
-    Build a SQL column definition string from the information_schema column dict.
-    """
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     name     = col["column_name"]
     dtype    = col["data_type"]
     nullable = col["is_nullable"]
     default  = col["column_default"]
     max_len  = col.get("character_maximum_length")
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # Map information_schema types to Postgres DDL types
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     type_map = {
         "character varying": f"VARCHAR({max_len})" if max_len else "TEXT",
         "character":         f"CHAR({max_len})"    if max_len else "CHAR",
@@ -215,33 +143,12 @@ def col_definition(col: dict) -> str:
     parts = [f'"{name}" {sql_type}']
     if nullable == "NO":
         parts.append("NOT NULL")
-<<<<<<< HEAD
     if default and "nextval" not in default:
         parts.append(f"DEFAULT {default}")
-=======
-<<<<<<< HEAD
-    if default and "nextval" not in default:   # skip serial sequences — handle separately
-        parts.append(f"DEFAULT {default}")
-
-=======
-    if default and "nextval" not in default:
-        parts.append(f"DEFAULT {default}")
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     return " ".join(parts)
 
 
 def create_tables(database: str, schema: dict):
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    """
-    Recreate every table from the schema dict inside the local database.
-    Creates PKs, unique constraints, and foreign keys.
-    """
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     conn = get_superuser_conn(database=database)
     conn.autocommit = False
     cur  = conn.cursor()
@@ -253,27 +160,11 @@ def create_tables(database: str, schema: dict):
         unique_cols  = defn["unique"]
 
         col_defs = [col_definition(c) for c in columns]
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-
-        if primary_keys:
-            pk_cols = ", ".join(f'"{c}"' for c in primary_keys)
-            col_defs.append(f"PRIMARY KEY ({pk_cols})")
-
-        for uc in unique_cols:
-            if uc not in primary_keys:          # don't double-declare PKs as UNIQUE
-=======
->>>>>>> 130b6a3 (phase-2)
         if primary_keys:
             pk_cols = ", ".join(f'"{c}"' for c in primary_keys)
             col_defs.append(f"PRIMARY KEY ({pk_cols})")
         for uc in unique_cols:
             if uc not in primary_keys:
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
                 col_defs.append(f'UNIQUE ("{uc}")')
 
         ddl = (
@@ -287,28 +178,12 @@ def create_tables(database: str, schema: dict):
         except psycopg2.Error as e:
             print(f"[client]   ERROR creating '{table}': {e}")
             conn.rollback()
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-            cur = conn.cursor()   # fresh cursor after error
-            continue
-
-    # Pass 2: Add foreign keys
-    for table, defn in schema.items():
-        foreign_keys = defn["foreign_keys"]
-        for fk in foreign_keys:
-=======
->>>>>>> 130b6a3 (phase-2)
             cur = conn.cursor()
             continue
 
     # Pass 2: Add foreign keys via ALTER TABLE (all tables exist by now)
     for table, defn in schema.items():
         for fk in defn["foreign_keys"]:
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
             alter_ddl = (
                 f'ALTER TABLE "{table}" ADD FOREIGN KEY ("{fk["column_name"]}") '
                 f'REFERENCES "{fk["foreign_table"]}" ("{fk["foreign_column"]}");'
@@ -328,29 +203,11 @@ def create_tables(database: str, schema: dict):
 
 
 def create_indexes(database: str, schema: dict):
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    """Recreate non-primary indexes."""
-    conn = get_superuser_conn(database=database, autocommit=True)
-    cur  = conn.cursor()
-
-    for table, defn in schema.items():
-        for idx in defn["indexes"]:
-            idx_def = idx["indexdef"]
-            # indexdef already is a full CREATE INDEX statement — execute as-is
-            # but use IF NOT EXISTS to be idempotent
-=======
->>>>>>> 130b6a3 (phase-2)
     conn = get_superuser_conn(database=database, autocommit=True)
     cur  = conn.cursor()
     for table, defn in schema.items():
         for idx in defn["indexes"]:
             idx_def = idx["indexdef"]
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
             if "CREATE UNIQUE INDEX" in idx_def:
                 idx_def = idx_def.replace("CREATE UNIQUE INDEX", "CREATE UNIQUE INDEX IF NOT EXISTS", 1)
             elif "CREATE INDEX" in idx_def:
@@ -360,35 +217,13 @@ def create_indexes(database: str, schema: dict):
                 print(f"[client]   Index '{idx['indexname']}' on '{table}' created.")
             except psycopg2.Error as e:
                 print(f"[client]   Skipping index '{idx['indexname']}': {e}")
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     cur.close()
     conn.close()
 
 
 def apply_permissions(database: str, user: str, permissions: dict):
-<<<<<<< HEAD
     conn = get_superuser_conn(database=database, autocommit=True)
     cur  = conn.cursor()
-=======
-<<<<<<< HEAD
-    """
-    Grant the same table-level privileges to `user` on the local database.
-    permissions = { table_name: [privilege, ...] }
-    """
-    conn = get_superuser_conn(database=database, autocommit=True)
-    cur  = conn.cursor()
-
-=======
-    conn = get_superuser_conn(database=database, autocommit=True)
-    cur  = conn.cursor()
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     for table, privs in permissions.items():
         priv_str = ", ".join(privs)
         sql = f'GRANT {priv_str} ON "{table}" TO "{user}";'
@@ -397,62 +232,17 @@ def apply_permissions(database: str, user: str, permissions: dict):
             print(f"[client]   GRANT {priv_str} ON {table} TO {user}")
         except psycopg2.Error as e:
             print(f"[client]   Permission error on {table}: {e}")
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     cur.close()
     conn.close()
 
 
-<<<<<<< HEAD
 def init_db(database: str, user: str, schema: dict, permissions: dict):
     print(f"[client] INIT_DB → database='{database}' user='{user}'")
-=======
-<<<<<<< HEAD
-# ─── Main Phase-1 Handler ─────────────────────────────────────────────────────
-
-def init_db(database: str, user: str, schema: dict, permissions: dict):
-    """
-    Full Phase-1 local setup:
-      1. Ensure local user role exists
-      2. Create local database
-      3. Recreate schema (tables, constraints)
-      4. Recreate indexes
-      5. Apply permissions
-      6. Register in schema_registry
-    """
-    print(f"[client] INIT_DB → database='{database}' user='{user}'")
-
-=======
-def init_db(database: str, user: str, schema: dict, permissions: dict):
-    print(f"[client] INIT_DB → database='{database}' user='{user}'")
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     ensure_local_user(user)
     create_local_database(database)
     create_tables(database, schema)
     create_indexes(database, schema)
     apply_permissions(database, user, permissions)
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-
-    schema_registry[database] = schema
-    local_cache_index[database] = {}   # no data cached yet
-
-    print(f"[client] INIT_DB complete for '{database}'.")
-
-
-# ─── Message I/O ──────────────────────────────────────────────────────────────
-
-async def send_msg(writer: asyncio.StreamWriter, msg: dict):
-    data = (json.dumps(msg) + "\n").encode()
-=======
->>>>>>> 130b6a3 (phase-2)
     schema_registry[database] = schema
     local_cache_index[(database, "__init__")] = set()
     print(f"[client] INIT_DB complete for '{database}'.")
@@ -565,10 +355,6 @@ def flush_pending(database: str, table: str, pks: list) -> list[dict]:
 
 async def send_msg(writer: asyncio.StreamWriter, msg: dict):
     data = (json.dumps(msg, default=str) + "\n").encode()
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     writer.write(data)
     await writer.drain()
 
@@ -597,14 +383,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
         msg_type = msg.get("type")
 
-<<<<<<< HEAD
         # ── Phase 1 ───────────────────────────────────────────────────────────
-=======
-<<<<<<< HEAD
-=======
-        # ── Phase 1 ───────────────────────────────────────────────────────────
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
         if msg_type == "INIT":
             client_id = msg["client_id"]
             print(f"[client] INIT from client_id={client_id}")
@@ -624,15 +403,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     "status":   "ok",
                 })
             except Exception as e:
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-                await send_msg(writer, {
-                    "type":    "ERROR",
-                    "message": str(e),
-                })
-=======
->>>>>>> 130b6a3 (phase-2)
                 await send_msg(writer, {"type": "ERROR", "message": str(e)})
 
         # ── Phase 2: cache check ───────────────────────────────────────────────
@@ -721,10 +491,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 del query_cache[fp]
             print(f"[client] Cache invalidated for {database}.{table}")
             await send_msg(writer, {"type": "CACHE_INVALIDATE_ACK", "table": table})
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
         else:
             await send_msg(writer, {

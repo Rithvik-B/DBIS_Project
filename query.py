@@ -1,22 +1,4 @@
 """
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-query.py — Query Router
-=======================
-Parses user-facing SQL-like commands and routes them.
-Phase 1 scope: parse the CONNECT command.
-Phase 2+ will add: SELECT/INSERT/UPDATE/DELETE routing with cache awareness.
-"""
-
-import re
-from dataclasses import dataclass
-from enum import Enum, auto
-
-
-# ─── Command Types ────────────────────────────────────────────────────────────
-=======
->>>>>>> 130b6a3 (phase-2)
 query.py — Query Router / Classifier
 =====================================
 Parses user-facing SQL commands and classifies them into routing types.
@@ -37,10 +19,6 @@ from enum import Enum, auto
 
 
 # ─── Command / Route Types ────────────────────────────────────────────────────
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
 class CommandType(Enum):
     CONNECT  = auto()
@@ -50,11 +28,6 @@ class CommandType(Enum):
     DELETE   = auto()
     UNKNOWN  = auto()
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
->>>>>>> 130b6a3 (phase-2)
 class RouteType(Enum):
     TYPE_A   = auto()   # non-cacheable → always remote
     TYPE_B   = auto()   # cacheable read → local if cached, else remote + cache
@@ -63,26 +36,10 @@ class RouteType(Enum):
     CONNECT  = auto()
     UNKNOWN  = auto()
 
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
 @dataclass
 class ParsedCommand:
     command_type: CommandType
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    raw:          str
-    params:       dict   # command-specific extracted params
-
-
-# ─── Parser ───────────────────────────────────────────────────────────────────
-
-# Pattern:  CONNECT <database> USER <user> [PASSWORD <password>];
-=======
->>>>>>> 130b6a3 (phase-2)
     route_type:   RouteType
     raw:          str
     params:       dict = field(default_factory=dict)
@@ -95,31 +52,11 @@ class ParsedCommand:
 
 # ─── Regex helpers ────────────────────────────────────────────────────────────
 
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 _CONNECT_RE = re.compile(
     r"^\s*CONNECT\s+(\w+)\s+USER\s+(\w+)(?:\s+PASSWORD\s+(\S+))?\s*;?\s*$",
     re.IGNORECASE,
 )
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-
-def parse(raw: str) -> ParsedCommand:
-    """
-    Parse a raw user command string and return a ParsedCommand.
-
-    Supported in Phase 1:
-        CONNECT <database> USER <user> [PASSWORD <password>];
-
-    Everything else is returned as UNKNOWN (to be expanded in Phase 2).
-    """
-    stripped = raw.strip()
-=======
->>>>>>> 130b6a3 (phase-2)
 # Tokens that make a SELECT non-cacheable
 _AGGREGATE_RE  = re.compile(r'\b(COUNT|SUM|AVG|MIN|MAX)\s*\(', re.IGNORECASE)
 _JOIN_RE       = re.compile(r'\bJOIN\b', re.IGNORECASE)
@@ -185,10 +122,6 @@ def _is_type_a(sql: str) -> bool:
 def parse(raw: str) -> ParsedCommand:
     stripped = raw.strip()
     upper    = stripped.upper()
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
     # ── CONNECT ───────────────────────────────────────────────────────────────
     m = _CONNECT_RE.match(stripped)
@@ -196,32 +129,6 @@ def parse(raw: str) -> ParsedCommand:
         database, user, password = m.group(1), m.group(2), m.group(3) or ""
         return ParsedCommand(
             command_type = CommandType.CONNECT,
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-            raw          = raw,
-            params       = {
-                "database": database,
-                "user":     user,
-                "password": password,
-            },
-        )
-
-    # ── SELECT (stub for Phase 2) ─────────────────────────────────────────────
-    if stripped.upper().startswith("SELECT"):
-        return ParsedCommand(CommandType.SELECT, raw, {})
-
-    # ── INSERT / UPDATE / DELETE (stubs) ──────────────────────────────────────
-    if stripped.upper().startswith("INSERT"):
-        return ParsedCommand(CommandType.INSERT, raw, {})
-    if stripped.upper().startswith("UPDATE"):
-        return ParsedCommand(CommandType.UPDATE, raw, {})
-    if stripped.upper().startswith("DELETE"):
-        return ParsedCommand(CommandType.DELETE, raw, {})
-
-    return ParsedCommand(CommandType.UNKNOWN, raw, {})
-=======
->>>>>>> 130b6a3 (phase-2)
             route_type   = RouteType.CONNECT,
             raw          = raw,
             params       = {"database": database, "user": user, "password": password},
@@ -298,7 +205,3 @@ def parse(raw: str) -> ParsedCommand:
         return ParsedCommand(CommandType.DELETE, RouteType.TYPE_C, raw)
 
     return ParsedCommand(CommandType.UNKNOWN, RouteType.UNKNOWN, raw)
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)

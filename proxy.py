@@ -4,24 +4,8 @@ proxy.py — Proxy / User Shell
 Acts as a psql-like shell. Coordinates between remote.py (port 5000)
 and client.py (port 5001).
 
-<<<<<<< HEAD
 Phase 1: CONNECT flow — schema replication.
 Phase 2: SELECT (Type A / B with cache), INSERT (remote), UPDATE/DELETE (lock+local).
-=======
-<<<<<<< HEAD
-Phase 1 flow:
-  1. On startup: connect to remote.py and client.py, send INIT handshakes
-  2. User types: CONNECT <database> USER <user>;
-  3. Proxy → remote.py: CONNECT message
-  4. remote.py responds with SCHEMA_TRANSFER
-  5. Proxy → client.py: INIT_DB message
-  6. client.py responds with INIT_DB_ACK
-  7. Proxy reports success to user
-=======
-Phase 1: CONNECT flow — schema replication.
-Phase 2: SELECT (Type A / B with cache), INSERT (remote), UPDATE/DELETE (lock+local).
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 """
 
 import asyncio
@@ -30,15 +14,7 @@ import os
 import uuid
 import getpass
 
-<<<<<<< HEAD
 import query as qmod
-=======
-<<<<<<< HEAD
-import query as qmod   # our query.py
-=======
-import query as qmod
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
 
 # ─── Configuration ────────────────────────────────────────────────────────────
@@ -49,15 +25,7 @@ if os.path.exists(CONFIG_FILE):
         config = json.load(f)
 else:
     config = {
-<<<<<<< HEAD
         "remote_host": "192.168.1.100",
-=======
-<<<<<<< HEAD
-        "remote_host": "192.168.1.100",  # IP address of the remote laptop
-=======
-        "remote_host": "192.168.1.100",
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
         "remote_port": 5000,
         "client_host": "localhost",
         "client_port": 5001
@@ -72,11 +40,6 @@ CLIENT_PORT = config.get("client_port", 5001)
 
 CLIENT_ID = f"proxy-{uuid.uuid4().hex[:8]}"
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
->>>>>>> 130b6a3 (phase-2)
 # Session state (set after CONNECT)
 _session: dict = {
     "database": None,
@@ -84,23 +47,11 @@ _session: dict = {
     "schema":   {},
 }
 
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
 # ─── Message I/O ──────────────────────────────────────────────────────────────
 
 async def send_msg(writer: asyncio.StreamWriter, msg: dict):
-<<<<<<< HEAD
     data = (json.dumps(msg, default=str) + "\n").encode()
-=======
-<<<<<<< HEAD
-    data = (json.dumps(msg) + "\n").encode()
-=======
-    data = (json.dumps(msg, default=str) + "\n").encode()
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     writer.write(data)
     await writer.drain()
 
@@ -115,12 +66,6 @@ async def recv_msg(reader: asyncio.StreamReader) -> dict | None:
         return None
 
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-# ─── Phase 1 Handlers ─────────────────────────────────────────────────────────
-=======
->>>>>>> 130b6a3 (phase-2)
 # ─── Display helpers ──────────────────────────────────────────────────────────
 
 def _print_table(rows: list[dict], columns: list[str]):
@@ -142,10 +87,6 @@ def _print_table(rows: list[dict], columns: list[str]):
 
 
 # ─── Phase 1: CONNECT ─────────────────────────────────────────────────────────
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
 async def do_connect(
     parsed:        qmod.ParsedCommand,
@@ -160,19 +101,9 @@ async def do_connect(
 
     if not password:
         loop = asyncio.get_event_loop()
-<<<<<<< HEAD
         password = await loop.run_in_executor(
             None, getpass.getpass, f"Password for user {user}: "
         )
-=======
-<<<<<<< HEAD
-        password = await loop.run_in_executor(None, getpass.getpass, f"Password for user {user}: ")
-=======
-        password = await loop.run_in_executor(
-            None, getpass.getpass, f"Password for user {user}: "
-        )
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
     print(f"\n[proxy] → Sending CONNECT to remote.py …")
     await send_msg(remote_writer, {
@@ -183,25 +114,6 @@ async def do_connect(
         "password":  password,
     })
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # ── Wait for SCHEMA_TRANSFER ───────────────────────────────────────────────
-    print("[proxy] ← Waiting for SCHEMA_TRANSFER from remote.py …")
-    msg = await recv_msg(remote_reader)
-    if msg is None:
-        print("[proxy] ERROR: remote.py closed connection unexpectedly.")
-        return
-
-    if msg["type"] == "ERROR":
-        print(f"[proxy] ERROR from remote.py: {msg['message']}")
-        return
-
-    if msg["type"] != "SCHEMA_TRANSFER":
-        print(f"[proxy] Unexpected message type: {msg['type']}")
-        return
-=======
->>>>>>> 130b6a3 (phase-2)
     print("[proxy] ← Waiting for SCHEMA_TRANSFER from remote.py …")
     msg = await recv_msg(remote_reader)
     if msg is None:
@@ -210,22 +122,11 @@ async def do_connect(
         print(f"[proxy] ERROR from remote.py: {msg['message']}"); return
     if msg["type"] != "SCHEMA_TRANSFER":
         print(f"[proxy] Unexpected message type: {msg['type']}"); return
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
     schema      = msg["schema"]
     permissions = msg["permissions"]
     print(f"[proxy] ✓ Schema received — {len(schema)} table(s): {list(schema.keys())}")
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # ── Forward to client.py ───────────────────────────────────────────────────
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     print("[proxy] → Sending INIT_DB to client.py …")
     await send_msg(client_writer, {
         "type":        "INIT_DB",
@@ -235,25 +136,6 @@ async def do_connect(
         "permissions": permissions,
     })
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # ── Wait for ACK ──────────────────────────────────────────────────────────
-    print("[proxy] ← Waiting for INIT_DB_ACK from client.py …")
-    ack = await recv_msg(client_reader)
-    if ack is None:
-        print("[proxy] ERROR: client.py closed connection unexpectedly.")
-        return
-
-    if ack["type"] == "ERROR":
-        print(f"[proxy] ERROR from client.py: {ack['message']}")
-        return
-
-    if ack["type"] == "INIT_DB_ACK" and ack.get("status") == "ok":
-        print(f"\n[proxy] ✅  Connected to '{database}' as '{user}'.")
-        print(f"[proxy]    Local replica is ready (schema only, no data yet).")
-=======
->>>>>>> 130b6a3 (phase-2)
     print("[proxy] ← Waiting for INIT_DB_ACK from client.py …")
     ack = await recv_msg(client_reader)
     if ack is None:
@@ -267,19 +149,10 @@ async def do_connect(
         _session["schema"]   = schema
         print(f"\n[proxy] ✅  Connected to '{database}' as '{user}'.")
         print(f"[proxy]    Local replica is ready (schema only, no data yet).\n")
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     else:
         print(f"[proxy] Unexpected response from client.py: {ack}")
 
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-=======
->>>>>>> 130b6a3 (phase-2)
 # ─── Phase 2: SELECT Type A — always remote ───────────────────────────────────
 
 async def do_select_type_a(
@@ -334,14 +207,14 @@ async def do_select_type_b(
 
     print(f"[proxy] Cache MISS → fetching from remote")
     await send_msg(remote_writer, {
-        "type":        "QUERY",
-        "client_id":   CLIENT_ID,
-        "database":    database,
-        "query_type":  "B",
-        "sql":         sql,
-        "table":       parsed.table,
+        "type":         "QUERY",
+        "client_id":    CLIENT_ID,
+        "database":     database,
+        "query_type":   "B",
+        "sql":          sql,
+        "table":        parsed.table,
         "where_clause": parsed.where_clause,
-        "fingerprint": fingerprint,
+        "fingerprint":  fingerprint,
     })
     msg = await recv_msg(remote_reader)
     if msg is None:
@@ -476,10 +349,6 @@ async def do_write(
     print(f"[proxy] (changes held locally; synced to remote on lock release)")
 
 
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 async def bootstrap(
@@ -488,13 +357,6 @@ async def bootstrap(
     client_reader: asyncio.StreamReader,
     client_writer: asyncio.StreamWriter,
 ):
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    """Send INIT handshakes to both servers."""
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     init_msg = {"type": "INIT", "client_id": CLIENT_ID}
 
     await send_msg(remote_writer, init_msg)
@@ -515,47 +377,19 @@ async def bootstrap(
 # ─── Main REPL ────────────────────────────────────────────────────────────────
 
 async def main():
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # Connect to remote.py
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     print(f"[proxy] Connecting to remote.py at {REMOTE_HOST}:{REMOTE_PORT} …")
     remote_reader, remote_writer = await asyncio.open_connection(REMOTE_HOST, REMOTE_PORT)
     print("[proxy] Connected to remote.py")
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # Connect to client.py
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     print(f"[proxy] Connecting to client.py at {CLIENT_HOST}:{CLIENT_PORT} …")
     client_reader, client_writer = await asyncio.open_connection(CLIENT_HOST, CLIENT_PORT)
     print("[proxy] Connected to client.py")
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # Handshake both
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     await bootstrap(remote_reader, remote_writer, client_reader, client_writer)
 
     print("\n[proxy] Ready. Type SQL-like commands (e.g. CONNECT mydb USER alice;)")
     print("[proxy] Type 'exit' to quit.\n")
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-    # REPL
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
     loop = asyncio.get_event_loop()
     while True:
         try:
@@ -574,22 +408,6 @@ async def main():
         parsed = qmod.parse(raw)
 
         if parsed.command_type == qmod.CommandType.CONNECT:
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
-            await do_connect(
-                parsed,
-                remote_reader, remote_writer,
-                client_reader, client_writer,
-            )
-
-        elif parsed.command_type == qmod.CommandType.UNKNOWN:
-            print(f"[proxy] Unknown command. (Phase 2 will handle queries.)")
-
-        else:
-            print(f"[proxy] Command type '{parsed.command_type.name}' not yet implemented (Phase 2).")
-=======
->>>>>>> 130b6a3 (phase-2)
             await do_connect(parsed, remote_reader, remote_writer,
                              client_reader, client_writer)
 
@@ -616,10 +434,6 @@ async def main():
 
         elif parsed.command_type == qmod.CommandType.UNKNOWN:
             print(f"[proxy] Unknown command.")
-<<<<<<< HEAD
-=======
->>>>>>> 6f6a987 (phase-2)
->>>>>>> 130b6a3 (phase-2)
 
     remote_writer.close()
     client_writer.close()
