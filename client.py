@@ -156,11 +156,11 @@ def create_tables(database: str, schema: dict):
     conn.autocommit = False
     cur  = conn.cursor()
 
+    # Pass 1: Create tables without foreign keys
     for table, defn in schema.items():
         columns      = defn["columns"]
         primary_keys = defn["primary_keys"]
         unique_cols  = defn["unique"]
-        foreign_keys = defn["foreign_keys"]
 
         col_defs = [col_definition(c) for c in columns]
 
@@ -171,12 +171,6 @@ def create_tables(database: str, schema: dict):
         for uc in unique_cols:
             if uc not in primary_keys:          # don't double-declare PKs as UNIQUE
                 col_defs.append(f'UNIQUE ("{uc}")')
-
-        for fk in foreign_keys:
-            col_defs.append(
-                f'FOREIGN KEY ("{fk["column_name"]}")'
-                f' REFERENCES "{fk["foreign_table"]}" ("{fk["foreign_column"]}")'
-            )
 
         ddl = (
             f'CREATE TABLE IF NOT EXISTS "{table}" (\n'
@@ -191,6 +185,23 @@ def create_tables(database: str, schema: dict):
             conn.rollback()
             cur = conn.cursor()   # fresh cursor after error
             continue
+
+    # Pass 2: Add foreign keys
+    for table, defn in schema.items():
+        foreign_keys = defn["foreign_keys"]
+        for fk in foreign_keys:
+            alter_ddl = (
+                f'ALTER TABLE "{table}" ADD FOREIGN KEY ("{fk["column_name"]}") '
+                f'REFERENCES "{fk["foreign_table"]}" ("{fk["foreign_column"]}");'
+            )
+            print(f"[client]   Adding FK to '{table}' on '{fk['column_name']}' …")
+            try:
+                cur.execute(alter_ddl)
+            except psycopg2.Error as e:
+                print(f"[client]   Skipping FK for '{table}': {e}")
+                conn.rollback()
+                cur = conn.cursor()
+                continue
 
     conn.commit()
     cur.close()
