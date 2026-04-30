@@ -97,33 +97,9 @@ proxy.py:  ✅ Connected to 'mydb' as 'alice'
 
 ---
 
-# Phase 2 — Query Routing, Caching, and Locking
+## Next: Phase 2
 
-## Query Classification
-
-| Type   | Criteria                                                    | Routing                          |
-|--------|-------------------------------------------------------------|----------------------------------|
-| Type A | Aggregates, JOINs, LIMIT, GROUP BY, no WHERE               | Always remote, never cached      |
-| Type B | Single-table SELECT with equality WHERE, no aggregates      | Cache-aware: local hit or remote fetch |
-| INSERT | Any INSERT                                                  | Always remote (PK assigned by sequence) |
-| Type C | UPDATE / DELETE                                             | WRITE lock + local apply + sync on release |
-
-## Additional Phase 2 Messages
-
-| Message            | Direction              | Purpose                                      |
-|--------------------|------------------------|----------------------------------------------|
-| `QUERY`            | proxy → remote         | Execute Type A / B / INSERT                  |
-| `QUERY_RESULT`     | remote → proxy         | Rows + PKs returned                          |
-| `CACHE_CHECK`      | proxy → client         | Is this fingerprint cached?                  |
-| `CACHE_HIT`        | client → proxy         | Yes — here are the local rows                |
-| `CACHE_MISS`       | client → proxy         | No — go to remote                            |
-| `CACHE_ROWS`       | proxy → client         | Store these rows + grant READ lock           |
-| `CACHE_ACK`        | client → proxy         | Rows stored                                  |
-| `LOCK_REQUEST`     | proxy → remote         | Request WRITE lock on PKs                    |
-| `LOCK_GRANT`       | remote → proxy         | Lock granted                                 |
-| `WRITE_LOCAL`      | proxy → client         | Apply this UPDATE/DELETE to local DB         |
-| `WRITE_ACK`        | client → proxy         | Write applied                                |
-| `RECALL_LOCK`      | remote → client        | Release your lock, send diffs                |
-| `LOCK_RELEASE`     | client → remote        | Here are pending changes                     |
-| `SYNC_ACK`         | remote → client        | Changes applied, lock released               |
-| `CACHE_INVALIDATE` | remote → client        | Evict cached rows (after remote INSERT)      |
+- `query.py` will parse SELECT/UPDATE/DELETE
+- `proxy.py` will check local cache before routing to remote
+- Cache-miss → fetch from remote → store locally → assign lock
+- Cache-hit → serve from local Postgres directly

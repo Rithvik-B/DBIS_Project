@@ -1,0 +1,8 @@
+{
+    "remote_db_host": "localhost",
+    "remote_db_port": 5432,
+    "remote_superuser": "postgres",
+    "remote_superuser_password": "db_postgres",
+    "listen_host": "0.0.0.0",
+    "listen_port": 5000
+}
