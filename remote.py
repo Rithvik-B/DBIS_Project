@@ -347,6 +347,18 @@ def _collect_writers_for_read(client_id: str, database: str, table: str,
     return holders
 
 
+def _collect_all_writers_for_table(client_id: str, database: str, table: str) -> dict:
+    """
+    Collect ALL write-lock holders on any row of a table that are not client_id.
+    Used before a TYPE_A query so any dirty write is flushed to remote first.
+    """
+    holders: dict = {}
+    for (db, tbl, pk), entry in row_locks.items():
+        if db == database and tbl == table and entry.write and entry.write != client_id:
+            holders.setdefault(entry.write, []).append(pk)
+    return holders
+
+
 # ─── Query execution ──────────────────────────────────────────────────────────
 
 def execute_query(database: str, sql: str) -> tuple[list[dict], list[str]]:
@@ -371,10 +383,11 @@ def execute_write(database: str, sql: str) -> int:
     return count
 
 
-def apply_changes(database: str, changes: list[dict]):
-    """Apply a list of {sql} dicts to the remote DB in a single transaction."""
+def apply_changes(database: str, changes: list[dict]) -> bool:
+    """Apply a list of {sql} dicts to the remote DB in a single transaction.
+    Returns True on success, False on failure."""
     if not changes:
-        return
+        return True
     conn = get_superuser_conn(database)
     cur  = conn.cursor()
     try:
@@ -382,9 +395,11 @@ def apply_changes(database: str, changes: list[dict]):
             cur.execute(ch["sql"])
         conn.commit()
         print(f"[remote] Applied {len(changes)} change(s).")
+        return True
     except Exception as e:
         conn.rollback()
         print(f"[remote] Error applying changes: {e}")
+        return False
     finally:
         cur.close()
         conn.close()
@@ -447,8 +462,12 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
 
     print(f"[remote] QUERY type={query_type} from {client_id}: {sql[:80]}")
 
-    # ── Type A: straight execution ─────────────────────────────────────────────
+    # ── Type A: recall all write holders for the table, then execute ──────────
     if query_type == "A":
+        if table:
+            writers = _collect_all_writers_for_table(client_id, database, table)
+            for holder, held_pks in writers.items():
+                await _recall_and_wait(holder, database, table, held_pks, client_id)
         try:
             rows, cols = execute_query(database, sql)
             await send_msg(writer, {
@@ -544,9 +563,10 @@ async def handle_lock_release(msg: dict, writer: asyncio.StreamWriter):
 
     print(f"[remote] LOCK_RELEASE from {client_id}: {len(pending_changes)} change(s)")
 
-    apply_changes(database, pending_changes)
+    ok = apply_changes(database, pending_changes)
 
-    # Invalidate caches on all other clients for affected tables
+    # Invalidate caches on all other clients for affected tables (even on failure,
+    # so stale readers don't cache data that may be partially changed)
     affected_tables = {ch.get("table", table) for ch in pending_changes}
     for tbl in affected_tables:
         await _notify_cache_invalidate(client_id, database, tbl)
@@ -558,6 +578,7 @@ async def handle_lock_release(msg: dict, writer: asyncio.StreamWriter):
         "database": database,
         "table":    table,
         "pks":      pks,
+        "success":  ok,
     })
 
     # Signal any waiting requester
@@ -579,19 +600,21 @@ async def handle_apply_changes(msg: dict, writer: asyncio.StreamWriter):
     print(f"[remote] APPLY_CHANGES source={source} db={database} "
           f"count={len(changes)}")
 
-    try:
-        apply_changes(database, changes)
-        # Invalidate caches for all affected tables
-        tables_affected = {ch.get("table", "") for ch in changes if ch.get("table")}
-        for tbl in tables_affected:
-            await _notify_cache_invalidate(None, database, tbl)
+    ok = apply_changes(database, changes)
+    if not ok:
         await send_msg(writer, {
-            "type":    "APPLY_ACK",
-            "database": database,
-            "count":   len(changes),
+            "type":    "ERROR",
+            "message": f"Failed to apply {len(changes)} change(s) to '{database}'",
         })
-    except Exception as e:
-        await send_msg(writer, {"type": "ERROR", "message": str(e)})
+        return
+    tables_affected = {ch.get("table", "") for ch in changes if ch.get("table")}
+    for tbl in tables_affected:
+        await _notify_cache_invalidate(None, database, tbl)
+    await send_msg(writer, {
+        "type":    "APPLY_ACK",
+        "database": database,
+        "count":   len(changes),
+    })
 
 
 async def _notify_cache_invalidate(sender_id: str | None, database: str, table: str):

@@ -145,24 +145,12 @@ async def _remote_reader_task(remote_reader: asyncio.StreamReader,
 
 
 async def _client_reader_task(client_reader: asyncio.StreamReader):
-    """
-    Continuously drain client_reader.
-    INSERT_FLUSH_FAILED → print immediately.
-    Everything else → put in _client_q for the command loop.
-    """
+    """Continuously drain client_reader → put in _client_q for the command loop."""
     while True:
         msg = await recv_msg(client_reader)
         if msg is None:
             break
-        if msg.get("type") == "INSERT_FLUSH_FAILED":
-            print(
-                f"\n[proxy] ⚠️  INSERT SYNC ALERT: {msg.get('message', '')}"
-                f"\n[proxy]    (The insert is still queued and will keep retrying.)"
-                f"\nproxy> ",
-                end="", flush=True,
-            )
-        else:
-            await _client_q.put(msg)
+        await _client_q.put(msg)
 
 
 async def _forward_cache_invalidate(msg: dict, client_writer: asyncio.StreamWriter):
@@ -172,6 +160,73 @@ async def _forward_cache_invalidate(msg: dict, client_writer: asyncio.StreamWrit
         await asyncio.wait_for(_client_q.get(), timeout=5.0)
     except Exception:
         pass
+
+
+# ─── Background INSERT flush (proxy-driven, every 1 s) ───────────────────────
+
+async def _background_insert_flush(remote_writer: asyncio.StreamWriter,
+                                   client_writer: asyncio.StreamWriter):
+    """
+    Every 1 second, ask client for pending inserts, apply them on remote,
+    then confirm to client so it clears them.
+    All traffic goes through the existing proxy connections — no new sockets.
+    """
+    _fail_counts: dict = {}   # database → consecutive failure count
+
+    while True:
+        await asyncio.sleep(1.0)
+        database = _session.get("database")
+        if not database:
+            continue
+
+        async with _op_lock:
+            await send_msg(client_writer, {
+                "type":     "FLUSH_INSERTS",
+                "database": database,
+            })
+            try:
+                ack = await asyncio.wait_for(_client_q.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                print("[proxy] BG flush: timeout waiting for client")
+                continue
+
+            if ack.get("type") == "ERROR":
+                print(f"[proxy] BG flush: client error: {ack.get('message')}")
+                continue
+
+            insert_changes = ack.get("insert_changes", [])
+            if not insert_changes:
+                _fail_counts.pop(database, None)
+                continue
+
+            await send_msg(remote_writer, {
+                "type":     "APPLY_CHANGES",
+                "database": database,
+                "changes":  insert_changes,
+                "source":   "INSERT",
+            })
+            try:
+                apply_ack = await asyncio.wait_for(_remote_q.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                print("[proxy] BG flush: timeout waiting for remote")
+                _fail_counts[database] = _fail_counts.get(database, 0) + 1
+                continue
+
+            if apply_ack.get("type") == "APPLY_ACK":
+                await send_msg(client_writer, {
+                    "type":     "FLUSH_INSERTS_DONE",
+                    "database": database,
+                })
+                try:
+                    await asyncio.wait_for(_client_q.get(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+                _fail_counts.pop(database, None)
+                print(f"[proxy] BG flush: {len(insert_changes)} insert(s) → remote '{database}'")
+            else:
+                _fail_counts[database] = _fail_counts.get(database, 0) + 1
+                fails = _fail_counts[database]
+                print(f"[proxy] BG flush failed ({fails}x): {apply_ack.get('message', apply_ack)}")
 
 
 # ─── RECALL_LOCK handler (runs as a background task) ─────────────────────────
@@ -221,8 +276,7 @@ async def _handle_recall_lock(msg: dict, remote_writer: asyncio.StreamWriter,
 
     # Update session
     _session["active_locks"].pop(table, None)
-    print(f"[proxy] ✓ Lock for '{table}' released to remote requester\nproxy> ",
-          end="", flush=True)
+    print(f"[proxy] ✓ Lock for '{table}' released to remote requester")
 
 
 # ─── Phase 1: CONNECT ─────────────────────────────────────────────────────────
@@ -374,6 +428,7 @@ async def do_select_type_a(parsed, remote_writer, client_writer):
         "database":   database,
         "query_type": "A",
         "sql":        parsed.raw,
+        "table":      table,
     })
     msg = await _remote_q.get()
     if msg["type"] == "ERROR":
@@ -387,6 +442,12 @@ async def do_select_type_b(parsed, remote_writer, client_writer):
     database    = _session["database"]
     fingerprint = parsed.fingerprint
     sql         = parsed.raw
+    table       = parsed.table
+
+    # Flush any pending local changes for this table before checking cache,
+    # so the cache and remote are always consistent.
+    if table:
+        await _pre_flush(database, [table], remote_writer, client_writer)
 
     await send_msg(client_writer, {
         "type":        "CACHE_CHECK",
@@ -569,6 +630,7 @@ async def main():
     # Start background reader tasks
     asyncio.create_task(_remote_reader_task(remote_reader, remote_writer, client_writer))
     asyncio.create_task(_client_reader_task(client_reader))
+    asyncio.create_task(_background_insert_flush(remote_writer, client_writer))
 
     await bootstrap(remote_writer, client_writer)
 

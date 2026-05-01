@@ -66,11 +66,16 @@ local_locks:       dict = {}   # (database, table, pk_str) → "READ" | "WRITE"
 pending_changes:   list = []   # type-C changes: {sql, database, table, pks}
 query_cache:       dict = {}   # fingerprint → {table, pks, database, pk_cols}
 
-# Lazy INSERT queue — each entry: {sql, database, table, retry_count}
+# Lazy INSERT queue — each entry: {sql, database, table}
 pending_inserts: list = []
 
-# All currently connected proxy StreamWriters (for unsolicited notifications)
-proxy_writers: set = set()
+# Entries being flushed via FLUSH_PENDING (in-flight, not yet confirmed done)
+# key: (database, table) → {inserts: list, type_c: list}
+_in_flight_flush: dict = {}
+
+# Entries being flushed via FLUSH_INSERTS (insert-only background flush)
+# key: database → list of insert entries in-flight
+_in_flight_inserts: dict = {}
 
 # Entries being flushed via FLUSH_PENDING (in-flight, not yet confirmed done)
 # key: (database, table) → {inserts: list, type_c: list}
@@ -333,10 +338,9 @@ def apply_insert_local(database: str, table: str, sql: str) -> int:
     count = cur.rowcount
     conn.commit(); cur.close(); conn.close()
     pending_inserts.append({
-        "sql":         sql,
-        "database":    database,
-        "table":       table,
-        "retry_count": 0,
+        "sql":      sql,
+        "database": database,
+        "table":    table,
     })
     print(f"[client] INSERT applied locally ({count} row(s)), "
           f"queued for remote sync (total pending={len(pending_inserts)})")
@@ -405,6 +409,26 @@ def confirm_flush_done(database: str, tables: list):
             del query_cache[fp]
 
 
+def collect_inserts_for_flush(database: str) -> list[dict]:
+    """
+    Return all pending inserts for a database and move them to _in_flight_inserts
+    so FLUSH_INSERTS_DONE can clean them up.  Does NOT touch pending_changes.
+    """
+    items = [e for e in pending_inserts if e["database"] == database]
+    _in_flight_inserts[database] = items
+    return [{"sql": e["sql"], "table": e["table"]} for e in items]
+
+
+def confirm_inserts_done(database: str):
+    """Called after proxy confirms inserts were applied to remote."""
+    flight = _in_flight_inserts.pop(database, [])
+    for e in flight:
+        try:
+            pending_inserts.remove(e)
+        except ValueError:
+            pass
+
+
 def flush_pending_for_recall(database: str, table: str, pks: list) -> list[dict]:
     """Used when remote RECALL_LOCK arrives (via proxy). Returns type-C changes."""
     relevant = [c for c in pending_changes
@@ -439,77 +463,7 @@ async def recv_msg(reader: asyncio.StreamReader) -> dict | None:
         return None
 
 
-# ─── Background INSERT Flush Task ─────────────────────────────────────────────
 
-async def background_insert_flush():
-    """
-    Every 1 second, push all pending inserts to remote.py via APPLY_CHANGES.
-    On failure: increment retry_count.  After > 5 failures, alert proxy writers.
-    The entry is NEVER dropped — it keeps retrying until it succeeds.
-    """
-    while True:
-        await asyncio.sleep(1.0)
-        if not pending_inserts:
-            continue
-
-        # Group by database
-        db_groups: dict[str, list] = {}
-        for e in list(pending_inserts):
-            db_groups.setdefault(e["database"], []).append(e)
-
-        for db, entries in db_groups.items():
-            changes = [{"sql": e["sql"], "table": e["table"]} for e in entries]
-            success = False
-            try:
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection(REMOTE_HOST, REMOTE_PORT), timeout=5.0
-                )
-                msg_str = json.dumps({
-                    "type":     "APPLY_CHANGES",
-                    "database": db,
-                    "changes":  changes,
-                    "source":   "INSERT",
-                }) + "\n"
-                writer.write(msg_str.encode())
-                await writer.drain()
-                line = await asyncio.wait_for(reader.readline(), timeout=5.0)
-                resp = json.loads(line.decode())
-                writer.close()
-                if resp.get("type") == "APPLY_ACK":
-                    for e in entries:
-                        try:
-                            pending_inserts.remove(e)
-                        except ValueError:
-                            pass
-                    success = True
-                    print(f"[client] BG flush: {len(entries)} insert(s) → remote '{db}'")
-                else:
-                    print(f"[client] BG flush: remote returned {resp}")
-            except Exception as ex:
-                print(f"[client] BG flush failed for '{db}': {ex}")
-
-            if not success:
-                for e in entries:
-                    e["retry_count"] = e.get("retry_count", 0) + 1
-
-                overdue = [e for e in entries if e.get("retry_count", 0) > 5]
-                if overdue:
-                    notif = json.dumps({
-                        "type":    "INSERT_FLUSH_FAILED",
-                        "message": (
-                            f"{len(overdue)} INSERT(s) in '{overdue[0]['table']}' "
-                            f"failed to sync after {overdue[0]['retry_count']} retries. "
-                            "Will keep retrying."
-                        ),
-                    }) + "\n"
-                    dead: set = set()
-                    for pw in list(proxy_writers):
-                        try:
-                            pw.write(notif.encode())
-                            await pw.drain()
-                        except Exception:
-                            dead.add(pw)
-                    proxy_writers.difference_update(dead)
 
 
 # ─── Connection Handler ────────────────────────────────────────────────────────
@@ -530,7 +484,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if msg_type == "INIT":
             client_id = msg["client_id"]
             print(f"[client] INIT from client_id={client_id}")
-            proxy_writers.add(writer)   # track for INSERT_FLUSH_FAILED alerts
             await send_msg(writer, {"type": "INIT_ACK", "client_id": client_id})
 
         elif msg_type == "INIT_DB":
@@ -668,6 +621,27 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             })
             print(f"[client] LOCK_RELEASE sent with {len(changes)} change(s)")
 
+        # ── Phase 2: background insert flush (proxy-driven) ──────────────────
+        elif msg_type == "FLUSH_INSERTS":
+            try:
+                database = msg["database"]
+                changes = collect_inserts_for_flush(database)
+                await send_msg(writer, {
+                    "type":           "FLUSH_INSERTS_ACK",
+                    "database":       database,
+                    "insert_changes": changes,
+                })
+            except Exception as e:
+                await send_msg(writer, {"type": "ERROR", "message": str(e)})
+
+        elif msg_type == "FLUSH_INSERTS_DONE":
+            try:
+                database = msg["database"]
+                confirm_inserts_done(database)
+                await send_msg(writer, {"type": "FLUSH_INSERTS_DONE_ACK", "database": database})
+            except Exception as e:
+                await send_msg(writer, {"type": "ERROR", "message": str(e)})
+
         # ── Phase 2: cache invalidation ───────────────────────────────────────
         elif msg_type == "CACHE_INVALIDATE":
             database = msg["database"]
@@ -686,7 +660,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "message": f"Unknown message type: {msg_type}",
             })
 
-    proxy_writers.discard(writer)
     writer.close()
 
 
@@ -695,8 +668,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 async def main():
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
     print(f"[client] Listening on {LISTEN_HOST}:{LISTEN_PORT}")
-    print(f"[client] Remote sync target: {REMOTE_HOST}:{REMOTE_PORT}")
-    asyncio.create_task(background_insert_flush())
     async with server:
         await server.serve_forever()
 
