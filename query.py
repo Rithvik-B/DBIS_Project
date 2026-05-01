@@ -4,11 +4,13 @@ query.py — Query Router / Classifier
 Parses user-facing SQL commands and classifies them into routing types.
 
 Type A — Non-cacheable: aggregates, no-WHERE, JOINs, subqueries, LIMIT/OFFSET,
-          GROUP BY, ORDER BY without equality WHERE. Route direct to remote.
+          GROUP BY, ORDER BY without equality WHERE. Route direct to remote,
+          BUT first pre-flush any dirty local state for the referenced table(s).
 Type B — Cacheable read: single-table SELECT with at least one equality WHERE
           condition, no aggregates. Cache result set locally under a READ lock.
 Type C — Write: UPDATE/DELETE (row-lock based, applied locally then synced).
-          INSERT always routes direct to remote.
+INSERT  — Lazy write: applied to local DB immediately, synced to remote in
+          background (every ~1 s) or before the next Type A on the same table.
 """
 
 import re
@@ -29,10 +31,10 @@ class CommandType(Enum):
     UNKNOWN  = auto()
 
 class RouteType(Enum):
-    TYPE_A   = auto()   # non-cacheable → always remote
+    TYPE_A   = auto()   # non-cacheable → remote (after pre-flush)
     TYPE_B   = auto()   # cacheable read → local if cached, else remote + cache
-    TYPE_C   = auto()   # write → lock + local apply + sync
-    INSERT   = auto()   # always remote
+    TYPE_C   = auto()   # write → lock + local apply + deferred sync on lock release
+    INSERT   = auto()   # lazy write → local first, background sync to remote
     CONNECT  = auto()
     UNKNOWN  = auto()
 
@@ -43,11 +45,11 @@ class ParsedCommand:
     route_type:   RouteType
     raw:          str
     params:       dict = field(default_factory=dict)
-    # For Type B / Type C:
-    table:        str  = ""          # single table name
+    # For Type B / Type C / INSERT:
+    table:        str  = ""          # single table name (also filled for Type A when detectable)
     where_clause: str  = ""          # raw WHERE text (everything after WHERE)
     fingerprint:  str  = ""          # stable hash for cache lookup
-    pk_cols:      list = field(default_factory=list)   # filled in later from schema
+    pk_cols:      list = field(default_factory=list)
 
 
 # ─── Regex helpers ────────────────────────────────────────────────────────────
@@ -63,36 +65,32 @@ _JOIN_RE       = re.compile(r'\bJOIN\b', re.IGNORECASE)
 _SUBQUERY_RE   = re.compile(r'\bSELECT\b.+\bSELECT\b', re.IGNORECASE | re.DOTALL)
 _LIMIT_RE      = re.compile(r'\bLIMIT\b', re.IGNORECASE)
 _GROUP_BY_RE   = re.compile(r'\bGROUP\s+BY\b', re.IGNORECASE)
-
-# Detect ORDER BY without an equality WHERE (approximation)
 _ORDER_BY_RE   = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
 _WHERE_EQ_RE   = re.compile(r'\bWHERE\b.+\b\w+\s*=\s*[^\s<>!]', re.IGNORECASE | re.DOTALL)
 
-# Matches a bare or double-quoted identifier, with an optional schema prefix.
-# Examples: employees, "employees", public.employees, "public"."employees"
+# Identifier patterns
 _IDENT     = r'(?:"[^"]*"|\w+)'
-_TABLE_PAT = r'(?:' + _IDENT + r'\.)?(' + _IDENT + r')'   # group captures table (last) part
+_TABLE_PAT = r'(?:' + _IDENT + r'\.)?(' + _IDENT + r')'
 
-# Extract table name from simple single-table SELECT
-# SELECT ... FROM [schema.]<table> [WHERE ...] [;]
+# SELECT ... FROM <table> [WHERE ...]
 _SELECT_FROM_RE = re.compile(
     r'^\s*SELECT\s+.+?\s+FROM\s+' + _TABLE_PAT + r'\s*(?:WHERE\s+(.+?))?\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract table name from UPDATE [schema.]<table> SET ... WHERE ...
+# UPDATE <table> SET ... WHERE ...
 _UPDATE_RE = re.compile(
     r'^\s*UPDATE\s+' + _TABLE_PAT + r'\s+SET\s+.+?\s+WHERE\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract table name from DELETE FROM [schema.]<table> WHERE ...
+# DELETE FROM <table> WHERE ...
 _DELETE_RE = re.compile(
     r'^\s*DELETE\s+FROM\s+' + _TABLE_PAT + r'\s+WHERE\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract table name from INSERT INTO [schema.]<table> ...
+# INSERT INTO <table> ...
 _INSERT_RE = re.compile(
     r'^\s*INSERT\s+INTO\s+' + _TABLE_PAT + r'(?=\s|\(|;|$)',
     re.IGNORECASE,
@@ -100,20 +98,17 @@ _INSERT_RE = re.compile(
 
 
 def _unquote(name: str) -> str:
-    """Strip surrounding double-quotes from an identifier."""
     if name.startswith('"') and name.endswith('"'):
         return name[1:-1]
     return name
 
 
 def _fingerprint(table: str, where: str) -> str:
-    """Stable cache key: hash of (table, normalised WHERE clause)."""
     key = json.dumps([table.lower(), where.strip().lower()])
     return hashlib.sha1(key.encode()).hexdigest()[:16]
 
 
 def _is_type_a(sql: str) -> bool:
-    """Return True if this SELECT cannot be cached."""
     if _AGGREGATE_RE.search(sql):
         return True
     if _JOIN_RE.search(sql):
@@ -149,16 +144,20 @@ def parse(raw: str) -> ParsedCommand:
     # ── SELECT ────────────────────────────────────────────────────────────────
     if upper.startswith("SELECT"):
         if _is_type_a(stripped):
+            # Still try to extract the table so proxy can pre-flush the right rows
+            m = _SELECT_FROM_RE.match(stripped)
+            table = _unquote(m.group(1)) if m else ""
             return ParsedCommand(
                 command_type = CommandType.SELECT,
                 route_type   = RouteType.TYPE_A,
                 raw          = raw,
+                table        = table,
             )
         # Try to parse as Type B
         m = _SELECT_FROM_RE.match(stripped)
         if m:
-            table       = _unquote(m.group(1))
-            where_text  = (m.group(2) or "").strip()
+            table      = _unquote(m.group(1))
+            where_text = (m.group(2) or "").strip()
             if where_text and _WHERE_EQ_RE.search("WHERE " + where_text):
                 return ParsedCommand(
                     command_type = CommandType.SELECT,
@@ -168,14 +167,16 @@ def parse(raw: str) -> ParsedCommand:
                     where_clause = where_text,
                     fingerprint  = _fingerprint(table, where_text),
                 )
-        # Falls through to Type A (no WHERE or no equality)
+        # No WHERE or no equality → Type A (with table extracted if possible)
+        table = _unquote(m.group(1)) if m else ""
         return ParsedCommand(
             command_type = CommandType.SELECT,
             route_type   = RouteType.TYPE_A,
             raw          = raw,
+            table        = table,
         )
 
-    # ── INSERT — always remote ────────────────────────────────────────────────
+    # ── INSERT — lazy (local first, background sync) ─────────────────────────
     if upper.startswith("INSERT"):
         m = _INSERT_RE.match(stripped)
         table = _unquote(m.group(1)) if m else ""

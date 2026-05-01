@@ -4,8 +4,29 @@ proxy.py — Proxy / User Shell
 Acts as a psql-like shell. Coordinates between remote.py (port 5000)
 and client.py (port 5001).
 
-Phase 1: CONNECT flow — schema replication.
-Phase 2: SELECT (Type A / B with cache), INSERT (remote), UPDATE/DELETE (lock+local).
+Architecture
+------------
+Two background tasks read from remote and client continuously and route
+messages into asyncio queues:
+
+  _remote_q  — normal responses from remote (QUERY_RESULT, LOCK_GRANT, …)
+  _client_q  — normal responses from client (CACHE_HIT, WRITE_ACK, …)
+
+Special unsolicited messages are handled out-of-band:
+  RECALL_LOCK (from remote) → _handle_recall_lock() runs as a separate task
+  CACHE_INVALIDATE (from remote) → forwarded to client silently
+  INSERT_FLUSH_FAILED (from client) → printed to console immediately
+
+A single asyncio.Lock (_op_lock) serialises the command-processing coroutine
+and the recall handler so they never interleave their protocol exchanges.
+
+Query Classification
+--------------------
+Type A  — non-cacheable SELECT → pre-flush dirty tables, then query remote.
+Type B  — cacheable SELECT with equality WHERE → local cache or remote + cache.
+INSERT  — lazy: apply locally, queue for background sync; return immediately.
+Type C  — UPDATE/DELETE: lock rows on remote, apply locally, release lock when
+          recalled or when pre-flush is triggered before a Type A query.
 """
 
 import asyncio
@@ -28,7 +49,7 @@ else:
         "remote_host": "192.168.1.100",
         "remote_port": 5000,
         "client_host": "localhost",
-        "client_port": 5001
+        "client_port": 5001,
     }
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
@@ -42,10 +63,20 @@ CLIENT_ID = f"proxy-{uuid.uuid4().hex[:8]}"
 
 # Session state (set after CONNECT)
 _session: dict = {
-    "database": None,
-    "user":     None,
-    "schema":   {},
+    "database":     None,
+    "user":         None,
+    "schema":       {},
+    # table → list[str]  — PKs for which this proxy holds a WRITE lock
+    "active_locks": {},
 }
+
+# ─── Message queues (filled by background reader tasks) ───────────────────────
+
+_remote_q: asyncio.Queue = None   # set in main()
+_client_q: asyncio.Queue = None
+
+# Single operation lock — prevents command loop and recall handler overlapping
+_op_lock: asyncio.Lock = None
 
 
 # ─── Message I/O ──────────────────────────────────────────────────────────────
@@ -72,13 +103,11 @@ def _print_table(rows: list[dict], columns: list[str]):
     if not rows:
         print("(0 rows)")
         return
-    cols = columns or list(rows[0].keys())
+    cols   = columns or list(rows[0].keys())
     widths = {c: max(len(str(c)), max(len(str(r.get(c, ""))) for r in rows)) for c in cols}
     sep    = "+" + "+".join("-" * (widths[c] + 2) for c in cols) + "+"
     header = "|" + "|".join(f" {c:<{widths[c]}} " for c in cols) + "|"
-    print(sep)
-    print(header)
-    print(sep)
+    print(sep); print(header); print(sep)
     for row in rows:
         line = "|" + "|".join(f" {str(row.get(c,'')):<{widths[c]}} " for c in cols) + "|"
         print(line)
@@ -86,15 +115,119 @@ def _print_table(rows: list[dict], columns: list[str]):
     print(f"({len(rows)} row{'s' if len(rows) != 1 else ''})")
 
 
+# ─── Background reader tasks ──────────────────────────────────────────────────
+
+async def _remote_reader_task(remote_reader: asyncio.StreamReader,
+                               remote_writer: asyncio.StreamWriter,
+                               client_writer: asyncio.StreamWriter):
+    """
+    Continuously drain remote_reader.
+    RECALL_LOCK → spawn _handle_recall_lock as a task.
+    CACHE_INVALIDATE → forward to client silently.
+    Everything else → put in _remote_q for the command loop.
+    """
+    while True:
+        msg = await recv_msg(remote_reader)
+        if msg is None:
+            break
+        mtype = msg.get("type", "")
+        if mtype == "RECALL_LOCK":
+            asyncio.create_task(
+                _handle_recall_lock(msg, remote_writer, client_writer)
+            )
+        elif mtype == "CACHE_INVALIDATE":
+            # Forward to client so it drops the stale cache entry
+            asyncio.create_task(
+                _forward_cache_invalidate(msg, client_writer)
+            )
+        else:
+            await _remote_q.put(msg)
+
+
+async def _client_reader_task(client_reader: asyncio.StreamReader):
+    """
+    Continuously drain client_reader.
+    INSERT_FLUSH_FAILED → print immediately.
+    Everything else → put in _client_q for the command loop.
+    """
+    while True:
+        msg = await recv_msg(client_reader)
+        if msg is None:
+            break
+        if msg.get("type") == "INSERT_FLUSH_FAILED":
+            print(
+                f"\n[proxy] ⚠️  INSERT SYNC ALERT: {msg.get('message', '')}"
+                f"\n[proxy]    (The insert is still queued and will keep retrying.)"
+                f"\nproxy> ",
+                end="", flush=True,
+            )
+        else:
+            await _client_q.put(msg)
+
+
+async def _forward_cache_invalidate(msg: dict, client_writer: asyncio.StreamWriter):
+    try:
+        await send_msg(client_writer, msg)
+        # consume the ack (we don't care about it)
+        await asyncio.wait_for(_client_q.get(), timeout=5.0)
+    except Exception:
+        pass
+
+
+# ─── RECALL_LOCK handler (runs as a background task) ─────────────────────────
+
+async def _handle_recall_lock(msg: dict, remote_writer: asyncio.StreamWriter,
+                               client_writer: asyncio.StreamWriter):
+    """
+    Remote is recalling our WRITE lock.  Under _op_lock:
+      1. Ask client for pending type-C changes for the table.
+      2. Send LOCK_RELEASE (with changes) to remote.
+      3. Confirm to client that flush is done.
+      4. Update session's active_locks.
+    """
+    database = msg["database"]
+    table    = msg["table"]
+    pks      = msg["pks"]
+    print(f"\n[proxy] ← RECALL_LOCK: {table} PKs={pks} — flushing & releasing …")
+
+    async with _op_lock:
+        # Step 1: flush pending changes from client
+        await send_msg(client_writer, {
+            "type":     "FLUSH_PENDING",
+            "database": database,
+            "tables":   [table],
+        })
+        flush_ack = await asyncio.wait_for(_client_q.get(), timeout=10.0)
+        type_c_changes = flush_ack.get("type_c_changes", [])
+
+        # Step 2: release lock on remote with the changes
+        await send_msg(remote_writer, {
+            "type":            "LOCK_RELEASE",
+            "client_id":       CLIENT_ID,
+            "database":        database,
+            "table":           table,
+            "pks":             pks,
+            "pending_changes": type_c_changes,
+        })
+        sync_ack = await asyncio.wait_for(_remote_q.get(), timeout=10.0)
+
+        # Step 3: tell client to finalise the flush
+        await send_msg(client_writer, {
+            "type":     "FLUSH_DONE",
+            "database": database,
+            "tables":   [table],
+        })
+        await asyncio.wait_for(_client_q.get(), timeout=5.0)
+
+    # Update session
+    _session["active_locks"].pop(table, None)
+    print(f"[proxy] ✓ Lock for '{table}' released to remote requester\nproxy> ",
+          end="", flush=True)
+
+
 # ─── Phase 1: CONNECT ─────────────────────────────────────────────────────────
 
-async def do_connect(
-    parsed:        qmod.ParsedCommand,
-    remote_reader: asyncio.StreamReader,
-    remote_writer: asyncio.StreamWriter,
-    client_reader: asyncio.StreamReader,
-    client_writer: asyncio.StreamWriter,
-):
+async def do_connect(parsed, remote_writer, client_writer):
     database = parsed.params["database"]
     user     = parsed.params["user"]
     password = parsed.params["password"]
@@ -114,14 +247,12 @@ async def do_connect(
         "password":  password,
     })
 
-    print("[proxy] ← Waiting for SCHEMA_TRANSFER from remote.py …")
-    msg = await recv_msg(remote_reader)
-    if msg is None:
-        print("[proxy] ERROR: remote.py closed connection unexpectedly."); return
+    print("[proxy] ← Waiting for SCHEMA_TRANSFER …")
+    msg = await _remote_q.get()
     if msg["type"] == "ERROR":
-        print(f"[proxy] ERROR from remote.py: {msg['message']}"); return
+        print(f"[proxy] ERROR: {msg['message']}"); return
     if msg["type"] != "SCHEMA_TRANSFER":
-        print(f"[proxy] Unexpected message type: {msg['type']}"); return
+        print(f"[proxy] Unexpected: {msg['type']}"); return
 
     schema      = msg["schema"]
     permissions = msg["permissions"]
@@ -135,13 +266,9 @@ async def do_connect(
         "schema":      schema,
         "permissions": permissions,
     })
-
-    print("[proxy] ← Waiting for INIT_DB_ACK from client.py …")
-    ack = await recv_msg(client_reader)
-    if ack is None:
-        print("[proxy] ERROR: client.py closed connection unexpectedly."); return
+    ack = await _client_q.get()
     if ack["type"] == "ERROR":
-        print(f"[proxy] ERROR from client.py: {ack['message']}"); return
+        print(f"[proxy] ERROR from client: {ack['message']}"); return
 
     if ack["type"] == "INIT_DB_ACK" and ack.get("status") == "ok":
         _session["database"] = database
@@ -150,17 +277,96 @@ async def do_connect(
         print(f"\n[proxy] ✅  Connected to '{database}' as '{user}'.")
         print(f"[proxy]    Local replica is ready (schema only, no data yet).\n")
     else:
-        print(f"[proxy] Unexpected response from client.py: {ack}")
+        print(f"[proxy] Unexpected response from client: {ack}")
 
 
-# ─── Phase 2: SELECT Type A — always remote ───────────────────────────────────
+# ─── Pre-flush helper (shared by Type A and voluntary lock release) ───────────
 
-async def do_select_type_a(
-    parsed:        qmod.ParsedCommand,
-    remote_reader: asyncio.StreamReader,
-    remote_writer: asyncio.StreamWriter,
-):
+async def _pre_flush(database: str, tables: list,
+                     remote_writer: asyncio.StreamWriter,
+                     client_writer: asyncio.StreamWriter) -> bool:
+    """
+    Push pending inserts and type-C changes for the given tables to remote.
+    Returns True on success (or if there was nothing to flush).
+    """
+    await send_msg(client_writer, {
+        "type":     "FLUSH_PENDING",
+        "database": database,
+        "tables":   tables,
+    })
+    flush_ack = await _client_q.get()
+    if flush_ack.get("type") == "ERROR":
+        print(f"[proxy] Pre-flush error from client: {flush_ack['message']}")
+        return False
+
+    insert_changes    = flush_ack.get("insert_changes", [])
+    type_c_changes    = flush_ack.get("type_c_changes", [])
+    write_pks_by_tbl  = flush_ack.get("write_pks_by_table", {})
+    all_changes       = insert_changes + type_c_changes
+
+    if not all_changes:
+        return True   # nothing dirty
+
+    print(f"[proxy] Pre-flushing {len(all_changes)} pending change(s) "
+          f"({len(insert_changes)} insert, {len(type_c_changes)} type-C) …")
+
+    # Send all changes (inserts + type-C) to remote via APPLY_CHANGES
+    await send_msg(remote_writer, {
+        "type":     "APPLY_CHANGES",
+        "database": database,
+        "changes":  all_changes,
+        "source":   "PRE_FLUSH",
+    })
+    apply_ack = await _remote_q.get()
+    ok = apply_ack.get("type") == "APPLY_ACK"
+    if not ok:
+        print(f"[proxy] WARNING: pre-flush apply failed: {apply_ack}")
+        return False
+
+    # If type-C changes were included, also release the write locks on remote
+    for tbl, pks in write_pks_by_tbl.items():
+        await send_msg(remote_writer, {
+            "type":            "LOCK_RELEASE",
+            "client_id":       CLIENT_ID,
+            "database":        database,
+            "table":           tbl,
+            "pks":             pks,
+            "pending_changes": [],   # already applied above via APPLY_CHANGES
+        })
+        await _remote_q.get()   # consume SYNC_ACK
+        _session["active_locks"].pop(tbl, None)
+
+    # Confirm to client that the entries can be permanently removed
+    await send_msg(client_writer, {
+        "type":     "FLUSH_DONE",
+        "database": database,
+        "tables":   tables,
+    })
+    await _client_q.get()   # consume FLUSH_DONE_ACK
+    return True
+
+
+# ─── Phase 2: SELECT Type A — always remote, pre-flush dirty tables ───────────
+
+async def do_select_type_a(parsed, remote_writer, client_writer):
     database = _session["database"]
+    table    = parsed.table   # may be "" for complex multi-table queries
+
+    # Determine which tables to pre-flush
+    if table:
+        tables_to_flush = [table]
+    else:
+        # No single table detected — flush everything that's dirty
+        tables_to_flush = (
+            list(_session["active_locks"].keys()) +
+            list({e["table"] for e in []})   # pending_inserts unknown here; flush all schema tables
+        )
+        if not tables_to_flush:
+            tables_to_flush = list(_session["schema"].keys())
+
+    print(f"[proxy] Type A → pre-flushing: {tables_to_flush}")
+    await _pre_flush(database, tables_to_flush, remote_writer, client_writer)
+
     print(f"[proxy] Type A query → remote")
     await send_msg(remote_writer, {
         "type":       "QUERY",
@@ -169,9 +375,7 @@ async def do_select_type_a(
         "query_type": "A",
         "sql":        parsed.raw,
     })
-    msg = await recv_msg(remote_reader)
-    if msg is None:
-        print("[proxy] ERROR: no response from remote."); return
+    msg = await _remote_q.get()
     if msg["type"] == "ERROR":
         print(f"[proxy] ERROR: {msg['message']}"); return
     _print_table(msg.get("rows", []), msg.get("columns", []))
@@ -179,13 +383,7 @@ async def do_select_type_a(
 
 # ─── Phase 2: SELECT Type B — cache-aware ─────────────────────────────────────
 
-async def do_select_type_b(
-    parsed:        qmod.ParsedCommand,
-    remote_reader: asyncio.StreamReader,
-    remote_writer: asyncio.StreamWriter,
-    client_reader: asyncio.StreamReader,
-    client_writer: asyncio.StreamWriter,
-):
+async def do_select_type_b(parsed, remote_writer, client_writer):
     database    = _session["database"]
     fingerprint = parsed.fingerprint
     sql         = parsed.raw
@@ -196,10 +394,7 @@ async def do_select_type_b(
         "fingerprint": fingerprint,
         "sql":         sql,
     })
-    ck = await recv_msg(client_reader)
-    if ck is None:
-        print("[proxy] ERROR: client did not respond to CACHE_CHECK."); return
-
+    ck = await _client_q.get()
     if ck["type"] == "CACHE_HIT":
         print(f"[proxy] Cache HIT (fp={fingerprint[:8]})")
         _print_table(ck.get("rows", []), ck.get("columns", []))
@@ -216,9 +411,7 @@ async def do_select_type_b(
         "where_clause": parsed.where_clause,
         "fingerprint":  fingerprint,
     })
-    msg = await recv_msg(remote_reader)
-    if msg is None:
-        print("[proxy] ERROR: no response from remote."); return
+    msg = await _remote_q.get()
     if msg["type"] == "ERROR":
         print(f"[proxy] ERROR: {msg['message']}"); return
 
@@ -237,49 +430,34 @@ async def do_select_type_b(
         "lock_type":   "READ",
         "fingerprint": fingerprint,
     })
-    ack = await recv_msg(client_reader)
-    if ack and ack["type"] == "ERROR":
+    ack = await _client_q.get()
+    if ack and ack.get("type") == "ERROR":
         print(f"[proxy] Cache store error: {ack['message']}")
 
     _print_table(rows, cols)
 
 
-# ─── Phase 2: INSERT — always remote ─────────────────────────────────────────
+# ─── Phase 2: INSERT — lazy (local first) ────────────────────────────────────
 
-async def do_insert(
-    parsed:        qmod.ParsedCommand,
-    remote_reader: asyncio.StreamReader,
-    remote_writer: asyncio.StreamWriter,
-    client_reader: asyncio.StreamReader,
-    client_writer: asyncio.StreamWriter,
-):
+async def do_insert(parsed, client_writer):
     database = _session["database"]
-    print(f"[proxy] INSERT → remote (always)")
-    await send_msg(remote_writer, {
-        "type":       "QUERY",
-        "client_id":  CLIENT_ID,
-        "database":   database,
-        "query_type": "INSERT",
-        "sql":        parsed.raw,
-        "table":      parsed.table,
+    print(f"[proxy] INSERT → local first (lazy remote sync)")
+    await send_msg(client_writer, {
+        "type":     "INSERT_LOCAL",
+        "database": database,
+        "table":    parsed.table,
+        "sql":      parsed.raw,
     })
-    msg = await recv_msg(remote_reader)
-    if msg is None:
-        print("[proxy] ERROR: no response from remote."); return
+    msg = await _client_q.get()
     if msg["type"] == "ERROR":
         print(f"[proxy] ERROR: {msg['message']}"); return
     print(f"INSERT {msg.get('rowcount', 0)}")
+    print(f"[proxy] (change queued for background sync to remote)")
 
 
 # ─── Phase 2: UPDATE / DELETE — lock + local apply ────────────────────────────
 
-async def do_write(
-    parsed:        qmod.ParsedCommand,
-    remote_reader: asyncio.StreamReader,
-    remote_writer: asyncio.StreamWriter,
-    client_reader: asyncio.StreamReader,
-    client_writer: asyncio.StreamWriter,
-):
+async def do_write(parsed, remote_writer, client_writer):
     database = _session["database"]
     table    = parsed.table
     schema   = _session["schema"].get(table, {})
@@ -289,7 +467,7 @@ async def do_write(
         print(f"[proxy] ERROR: cannot determine PKs for table '{table}'.")
         return
 
-    # Step 1: resolve matching PKs via a remote SELECT
+    # Step 1: resolve matching PKs via a remote SELECT (Type A — no pre-flush here)
     pk_select = f'SELECT {", ".join(pk_cols)} FROM "{table}" WHERE {parsed.where_clause};'
     print(f"[proxy] Resolving PKs: {pk_select}")
     await send_msg(remote_writer, {
@@ -299,8 +477,8 @@ async def do_write(
         "query_type": "A",
         "sql":        pk_select,
     })
-    pk_msg = await recv_msg(remote_reader)
-    if pk_msg is None or pk_msg["type"] == "ERROR":
+    pk_msg = await _remote_q.get()
+    if pk_msg is None or pk_msg.get("type") == "ERROR":
         print(f"[proxy] ERROR resolving PKs: {pk_msg}"); return
 
     pk_rows = pk_msg.get("rows", [])
@@ -324,10 +502,13 @@ async def do_write(
         "table":     table,
         "pks":       pks,
     })
-    lock_msg = await recv_msg(remote_reader)
-    if lock_msg is None or lock_msg["type"] != "LOCK_GRANT":
+    lock_msg = await _remote_q.get()
+    if lock_msg is None or lock_msg.get("type") != "LOCK_GRANT":
         print(f"[proxy] Lock not granted: {lock_msg}"); return
     print(f"[proxy] ✓ WRITE lock granted")
+
+    # Track active lock
+    _session["active_locks"][table] = pks
 
     # Step 3: apply write to local DB
     await send_msg(client_writer, {
@@ -338,10 +519,10 @@ async def do_write(
         "pk_cols":  pk_cols,
         "pks":      pks,
     })
-    ack = await recv_msg(client_reader)
+    ack = await _client_q.get()
     if ack is None:
         print("[proxy] ERROR: no response from client."); return
-    if ack["type"] == "ERROR":
+    if ack.get("type") == "ERROR":
         print(f"[proxy] ERROR applying write: {ack['message']}"); return
 
     verb = parsed.command_type.name
@@ -351,23 +532,18 @@ async def do_write(
 
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 
-async def bootstrap(
-    remote_reader: asyncio.StreamReader,
-    remote_writer: asyncio.StreamWriter,
-    client_reader: asyncio.StreamReader,
-    client_writer: asyncio.StreamWriter,
-):
+async def bootstrap(remote_writer, client_writer):
     init_msg = {"type": "INIT", "client_id": CLIENT_ID}
 
     await send_msg(remote_writer, init_msg)
-    remote_ack = await recv_msg(remote_reader)
+    remote_ack = await _remote_q.get()
     if remote_ack and remote_ack.get("type") == "INIT_ACK":
         print(f"[proxy] ✓ remote.py handshake OK (client_id={CLIENT_ID})")
     else:
         print(f"[proxy] WARNING: unexpected INIT response from remote: {remote_ack}")
 
     await send_msg(client_writer, init_msg)
-    client_ack = await recv_msg(client_reader)
+    client_ack = await _client_q.get()
     if client_ack and client_ack.get("type") == "INIT_ACK":
         print(f"[proxy] ✓ client.py handshake OK")
     else:
@@ -377,6 +553,11 @@ async def bootstrap(
 # ─── Main REPL ────────────────────────────────────────────────────────────────
 
 async def main():
+    global _remote_q, _client_q, _op_lock
+    _remote_q = asyncio.Queue()
+    _client_q = asyncio.Queue()
+    _op_lock  = asyncio.Lock()
+
     print(f"[proxy] Connecting to remote.py at {REMOTE_HOST}:{REMOTE_PORT} …")
     remote_reader, remote_writer = await asyncio.open_connection(REMOTE_HOST, REMOTE_PORT)
     print("[proxy] Connected to remote.py")
@@ -385,7 +566,11 @@ async def main():
     client_reader, client_writer = await asyncio.open_connection(CLIENT_HOST, CLIENT_PORT)
     print("[proxy] Connected to client.py")
 
-    await bootstrap(remote_reader, remote_writer, client_reader, client_writer)
+    # Start background reader tasks
+    asyncio.create_task(_remote_reader_task(remote_reader, remote_writer, client_writer))
+    asyncio.create_task(_client_reader_task(client_reader))
+
+    await bootstrap(remote_writer, client_writer)
 
     print("\n[proxy] Ready. Type SQL-like commands (e.g. CONNECT mydb USER alice;)")
     print("[proxy] Type 'exit' to quit.\n")
@@ -407,35 +592,32 @@ async def main():
 
         parsed = qmod.parse(raw)
 
-        if parsed.command_type == qmod.CommandType.CONNECT:
-            await do_connect(parsed, remote_reader, remote_writer,
-                             client_reader, client_writer)
+        async with _op_lock:
+            if parsed.command_type == qmod.CommandType.CONNECT:
+                await do_connect(parsed, remote_writer, client_writer)
 
-        elif parsed.command_type == qmod.CommandType.SELECT:
-            if not _session["database"]:
-                print("[proxy] Not connected. Use CONNECT first."); continue
-            print(f"[proxy] Classified as {parsed.route_type.name} "
-                  f"| table={repr(parsed.table)} | where={repr(parsed.where_clause)}")
-            if parsed.route_type == qmod.RouteType.TYPE_B:
-                await do_select_type_b(parsed, remote_reader, remote_writer,
-                                       client_reader, client_writer)
-            else:
-                await do_select_type_a(parsed, remote_reader, remote_writer)
+            elif parsed.command_type == qmod.CommandType.SELECT:
+                if not _session["database"]:
+                    print("[proxy] Not connected. Use CONNECT first."); continue
+                print(f"[proxy] Classified as {parsed.route_type.name} "
+                      f"| table={repr(parsed.table)} | where={repr(parsed.where_clause)}")
+                if parsed.route_type == qmod.RouteType.TYPE_B:
+                    await do_select_type_b(parsed, remote_writer, client_writer)
+                else:
+                    await do_select_type_a(parsed, remote_writer, client_writer)
 
-        elif parsed.command_type == qmod.CommandType.INSERT:
-            if not _session["database"]:
-                print("[proxy] Not connected."); continue
-            await do_insert(parsed, remote_reader, remote_writer,
-                            client_reader, client_writer)
+            elif parsed.command_type == qmod.CommandType.INSERT:
+                if not _session["database"]:
+                    print("[proxy] Not connected."); continue
+                await do_insert(parsed, client_writer)
 
-        elif parsed.command_type in (qmod.CommandType.UPDATE, qmod.CommandType.DELETE):
-            if not _session["database"]:
-                print("[proxy] Not connected."); continue
-            await do_write(parsed, remote_reader, remote_writer,
-                           client_reader, client_writer)
+            elif parsed.command_type in (qmod.CommandType.UPDATE, qmod.CommandType.DELETE):
+                if not _session["database"]:
+                    print("[proxy] Not connected."); continue
+                await do_write(parsed, remote_writer, client_writer)
 
-        elif parsed.command_type == qmod.CommandType.UNKNOWN:
-            print(f"[proxy] Unknown command.")
+            elif parsed.command_type == qmod.CommandType.UNKNOWN:
+                print(f"[proxy] Unknown command.")
 
     remote_writer.close()
     client_writer.close()

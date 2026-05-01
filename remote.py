@@ -4,7 +4,16 @@ remote.py — Remote Brain
 Listens on port 5000. Sits in front of the actual remote PostgreSQL instance.
 
 Phase 1: CONNECT → authenticate, fetch schema + permissions, send SCHEMA_TRANSFER
-Phase 2: QUERY (Type A/B/INSERT), LOCK_REQUEST, LOCK_RELEASE (recall protocol)
+Phase 2: QUERY (Type A/B), LOCK_REQUEST, LOCK_RELEASE (recall protocol), APPLY_CHANGES
+
+Lock model (per row key):
+  RowLock.write   : client_id holding exclusive write lock, or None
+  RowLock.readers : set of client_ids with shared read lock
+
+Rules:
+  - Multiple readers allowed simultaneously.
+  - A WRITE request recalls ALL readers + any other writer, then grants exclusively.
+  - A READ request only recalls an existing writer; existing readers are untouched.
 """
 
 import asyncio
@@ -43,18 +52,22 @@ LISTEN_PORT               = config.get("listen_port", 5000)
 # ─── Global State ─────────────────────────────────────────────────────────────
 
 subscriptions: dict = {}   # client_id → {database, user}
-clients: dict       = {}   # client_id → asyncio.StreamWriter
+clients: dict       = {}   # client_id → asyncio.StreamWriter  (writer back to proxy)
 
-# row_locks[(database, table, pk_value)] = LockEntry
+# Per-writer mutex so concurrent coroutines don't interleave writes
+_writer_locks: dict = {}   # writer id → asyncio.Lock
+
+
 @dataclass
-class LockEntry:
-    holder:    str
-    lock_type: str              # "READ" or "WRITE"
-    waitlist:  list = field(default_factory=list)
+class RowLock:
+    write:   str | None = None          # client_id holding WRITE lock, or None
+    readers: set        = field(default_factory=set)  # client_ids with READ lock
 
-row_locks: dict = {}   # (db, table, pk) → LockEntry
 
-# client_cache_map[client_id][(database, table)] = set of pk values
+# (database, table, pk_value_str) → RowLock
+row_locks: dict = {}
+
+# client_id → {(database, table): set(pk_str)}  — tracks what each client has cached
 client_cache_map: dict = {}
 
 # Events signalled when a LOCK_RELEASE arrives from a holder
@@ -81,7 +94,7 @@ def authenticate_user(database: str, user: str, password: str = "") -> bool:
             "connect_timeout": 5,
         }
         if password:
-            if password == "postgres":
+            if password == "fakepd":
                 kwargs["password"] = REMOTE_SUPERUSER_PASSWORD
             else:
                 kwargs["password"] = password
@@ -206,9 +219,12 @@ def get_pk_columns(database: str, table: str) -> list[str]:
 # ─── Message I/O ──────────────────────────────────────────────────────────────
 
 async def send_msg(writer: asyncio.StreamWriter, msg: dict):
+    """Send a message, serialised with a per-writer lock to avoid interleaving."""
+    lock = _writer_locks.setdefault(id(writer), asyncio.Lock())
     data = (json.dumps(msg, default=str) + "\n").encode()
-    writer.write(data)
-    await writer.drain()
+    async with lock:
+        writer.write(data)
+        await writer.drain()
 
 
 async def recv_msg(reader: asyncio.StreamReader) -> dict | None:
@@ -227,6 +243,22 @@ def _lock_key(database: str, table: str, pk) -> tuple:
     return (database, table, str(pk))
 
 
+def _get_or_create_lock(database: str, table: str, pk) -> RowLock:
+    key = _lock_key(database, table, pk)
+    if key not in row_locks:
+        row_locks[key] = RowLock()
+    return row_locks[key]
+
+
+def _cleanup_lock(database: str, table: str, pk):
+    """Remove RowLock entry if it has no holders."""
+    key = _lock_key(database, table, pk)
+    if key in row_locks:
+        entry = row_locks[key]
+        if entry.write is None and not entry.readers:
+            del row_locks[key]
+
+
 def _register_cache(client_id: str, database: str, table: str, pks: list):
     client_cache_map.setdefault(client_id, {})
     key = (database, table)
@@ -234,23 +266,29 @@ def _register_cache(client_id: str, database: str, table: str, pks: list):
 
 
 def _clear_locks_for_client(client_id: str, database: str, table: str, pks: list):
+    """Remove client from write/readers for the given PKs."""
     for pk in pks:
         key = _lock_key(database, table, pk)
-        if key in row_locks and row_locks[key].holder == client_id:
-            del row_locks[key]
-    key = (database, table)
+        if key in row_locks:
+            entry = row_locks[key]
+            if entry.write == client_id:
+                entry.write = None
+            entry.readers.discard(client_id)
+            _cleanup_lock(database, table, pk)
+    ct_key = (database, table)
     if client_id in client_cache_map:
-        client_cache_map[client_id].pop(key, None)
+        client_cache_map[client_id].pop(ct_key, None)
 
 
-async def _recall_and_wait(client_id: str, database: str, table: str,
+async def _recall_and_wait(holder_id: str, database: str, table: str,
                             pks: list, requester_id: str) -> bool:
-    writer = clients.get(client_id)
+    """Send RECALL_LOCK to holder and wait for LOCK_RELEASE (up to 30 s)."""
+    writer = clients.get(holder_id)
     if writer is None:
-        _clear_locks_for_client(client_id, database, table, pks)
+        _clear_locks_for_client(holder_id, database, table, pks)
         return True
 
-    print(f"[remote] Recalling lock from {client_id} for PKs {pks} "
+    print(f"[remote] Recalling lock from {holder_id} PKs={pks} "
           f"(requested by {requester_id})")
     await send_msg(writer, {
         "type":     "RECALL_LOCK",
@@ -259,17 +297,54 @@ async def _recall_and_wait(client_id: str, database: str, table: str,
         "pks":      pks,
     })
 
-    event_key = (database, table, "recall", client_id)
+    event_key = (database, table, "recall", holder_id)
     event = asyncio.Event()
     _lock_events[event_key] = event
     try:
         await asyncio.wait_for(event.wait(), timeout=30.0)
     except asyncio.TimeoutError:
-        print(f"[remote] Timeout waiting for LOCK_RELEASE from {client_id}")
-        _clear_locks_for_client(client_id, database, table, pks)
+        print(f"[remote] Timeout waiting for LOCK_RELEASE from {holder_id}")
+        _clear_locks_for_client(holder_id, database, table, pks)
     finally:
         _lock_events.pop(event_key, None)
     return True
+
+
+def _collect_holders_for_write(client_id: str, database: str, table: str,
+                                pks: list) -> dict:
+    """
+    Collect all current lock holders (readers + writer) that are not client_id,
+    grouped by holder → [pks].  Used before granting a WRITE lock.
+    """
+    holders: dict = {}
+    for pk in pks:
+        key = _lock_key(database, table, pk)
+        if key not in row_locks:
+            continue
+        entry = row_locks[key]
+        if entry.write and entry.write != client_id:
+            holders.setdefault(entry.write, []).append(pk)
+        for reader in entry.readers:
+            if reader != client_id:
+                holders.setdefault(reader, []).append(pk)
+    return holders
+
+
+def _collect_writers_for_read(client_id: str, database: str, table: str,
+                               pks: list) -> dict:
+    """
+    Collect WRITE-lock holders that are not client_id, grouped by holder → [pks].
+    Used before granting a READ lock (readers may coexist; only writers block).
+    """
+    holders: dict = {}
+    for pk in pks:
+        key = _lock_key(database, table, pk)
+        if key not in row_locks:
+            continue
+        entry = row_locks[key]
+        if entry.write and entry.write != client_id:
+            holders.setdefault(entry.write, []).append(pk)
+    return holders
 
 
 # ─── Query execution ──────────────────────────────────────────────────────────
@@ -297,6 +372,7 @@ def execute_write(database: str, sql: str) -> int:
 
 
 def apply_changes(database: str, changes: list[dict]):
+    """Apply a list of {sql} dicts to the remote DB in a single transaction."""
     if not changes:
         return
     conn = get_superuser_conn(database)
@@ -305,7 +381,7 @@ def apply_changes(database: str, changes: list[dict]):
         for ch in changes:
             cur.execute(ch["sql"])
         conn.commit()
-        print(f"[remote] Applied {len(changes)} change(s) from sync.")
+        print(f"[remote] Applied {len(changes)} change(s).")
     except Exception as e:
         conn.rollback()
         print(f"[remote] Error applying changes: {e}")
@@ -328,7 +404,7 @@ async def handle_connect(msg: dict, writer: asyncio.StreamWriter):
     user      = msg["user"]
     password  = msg.get("password", "")
 
-    print(f"[remote] CONNECT request — client={client_id} db={database} user={user}")
+    print(f"[remote] CONNECT — client={client_id} db={database} user={user}")
 
     if not authenticate_user(database, user, password):
         await send_msg(writer, {
@@ -338,16 +414,13 @@ async def handle_connect(msg: dict, writer: asyncio.StreamWriter):
         return
 
     subscriptions[client_id] = {"database": database, "user": user}
-    print(f"[remote] Subscription registered: {subscriptions[client_id]}")
 
-    print(f"[remote] Fetching schema for database '{database}' …")
     try:
         schema = fetch_schema(database)
     except Exception as e:
         await send_msg(writer, {"type": "ERROR", "message": f"Schema fetch failed: {e}"})
         return
 
-    print(f"[remote] Fetching permissions for user '{user}' …")
     try:
         permissions = fetch_permissions(database, user)
     except Exception as e:
@@ -374,31 +447,22 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
 
     print(f"[remote] QUERY type={query_type} from {client_id}: {sql[:80]}")
 
-    if query_type in ("A", "INSERT"):
+    # ── Type A: straight execution ─────────────────────────────────────────────
+    if query_type == "A":
         try:
-            if query_type == "INSERT":
-                rowcount = execute_write(database, sql)
-                await _notify_insert(client_id, database, table)
-                await send_msg(writer, {
-                    "type":       "QUERY_RESULT",
-                    "query_type": query_type,
-                    "rowcount":   rowcount,
-                    "rows":       [],
-                    "columns":    [],
-                })
-            else:
-                rows, cols = execute_query(database, sql)
-                await send_msg(writer, {
-                    "type":       "QUERY_RESULT",
-                    "query_type": query_type,
-                    "rows":       rows,
-                    "columns":    cols,
-                    "rowcount":   len(rows),
-                })
+            rows, cols = execute_query(database, sql)
+            await send_msg(writer, {
+                "type":       "QUERY_RESULT",
+                "query_type": "A",
+                "rows":       rows,
+                "columns":    cols,
+                "rowcount":   len(rows),
+            })
         except Exception as e:
             await send_msg(writer, {"type": "ERROR", "message": str(e)})
         return
 
+    # ── Type B: cacheable read ─────────────────────────────────────────────────
     if query_type == "B":
         try:
             rows, cols = execute_query(database, sql)
@@ -416,23 +480,15 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
             else:
                 pks.append(json.dumps([str(row[c]) for c in pk_cols]))
 
-        # Recall any conflicting WRITE holders before granting READ
-        conflicting: dict = {}
-        for pk in pks:
-            key = _lock_key(database, table, pk)
-            if key in row_locks and row_locks[key].lock_type == "WRITE":
-                holder = row_locks[key].holder
-                if holder != client_id:
-                    conflicting.setdefault(holder, []).append(pk)
-
-        for holder, held_pks in conflicting.items():
+        # Recall any WRITE holders before granting READ (readers may coexist)
+        writers_to_recall = _collect_writers_for_read(client_id, database, table, pks)
+        for holder, held_pks in writers_to_recall.items():
             await _recall_and_wait(holder, database, table, held_pks, client_id)
 
-        # Grant READ locks (shared — don't overwrite an existing READ entry)
+        # Grant READ: add requester to readers set; do NOT disturb existing readers
         for pk in pks:
-            key = _lock_key(database, table, pk)
-            if key not in row_locks:
-                row_locks[key] = LockEntry(holder=client_id, lock_type="READ")
+            entry = _get_or_create_lock(database, table, pk)
+            entry.readers.add(client_id)
         _register_cache(client_id, database, table, pks)
 
         await send_msg(writer, {
@@ -446,13 +502,14 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
             "fingerprint": msg.get("fingerprint", ""),
             "rowcount":    len(rows),
         })
-        print(f"[remote] Type B: {len(rows)} row(s), PKs={pks[:5]}{'...' if len(pks)>5 else ''}")
+        print(f"[remote] Type B: {len(rows)} row(s), READ lock granted to {client_id}")
         return
 
     await send_msg(writer, {"type": "ERROR", "message": f"Unknown query_type: {query_type}"})
 
 
 async def handle_lock_request(msg: dict, writer: asyncio.StreamWriter):
+    """Grant an exclusive WRITE lock after recalling ALL current holders."""
     client_id = msg["client_id"]
     database  = msg["database"]
     table     = msg["table"]
@@ -460,27 +517,26 @@ async def handle_lock_request(msg: dict, writer: asyncio.StreamWriter):
 
     print(f"[remote] LOCK_REQUEST WRITE from {client_id} on {table} PKs={pks}")
 
-    conflicting: dict = {}
-    for pk in pks:
-        key = _lock_key(database, table, pk)
-        if key in row_locks:
-            holder = row_locks[key].holder
-            if holder != client_id:
-                conflicting.setdefault(holder, []).append(pk)
+    # Collect every holder (readers + writer) that is not the requester
+    holders = _collect_holders_for_write(client_id, database, table, pks)
 
-    for holder, held_pks in conflicting.items():
+    # Recall all of them (in parallel would be nicer; serial is simpler and safe)
+    for holder, held_pks in holders.items():
         await _recall_and_wait(holder, database, table, held_pks, client_id)
 
+    # Grant exclusive WRITE lock
     for pk in pks:
-        key = _lock_key(database, table, pk)
-        row_locks[key] = LockEntry(holder=client_id, lock_type="WRITE")
+        entry = _get_or_create_lock(database, table, pk)
+        entry.write   = client_id
+        entry.readers = set()   # clear all readers — WRITE is exclusive
 
     await send_msg(writer, {"type": "LOCK_GRANT", "table": table, "pks": pks})
-    print(f"[remote] LOCK_GRANT WRITE to {client_id} on {table} PKs={pks}")
+    print(f"[remote] LOCK_GRANT WRITE → {client_id} on {table} PKs={pks}")
 
 
 async def handle_lock_release(msg: dict, writer: asyncio.StreamWriter):
-    client_id       = msg["client_id"]
+    """Apply pending changes and release the lock."""
+    client_id       = msg.get("client_id", "")
     database        = msg["database"]
     table           = msg["table"]
     pks             = msg["pks"]
@@ -489,6 +545,12 @@ async def handle_lock_release(msg: dict, writer: asyncio.StreamWriter):
     print(f"[remote] LOCK_RELEASE from {client_id}: {len(pending_changes)} change(s)")
 
     apply_changes(database, pending_changes)
+
+    # Invalidate caches on all other clients for affected tables
+    affected_tables = {ch.get("table", table) for ch in pending_changes}
+    for tbl in affected_tables:
+        await _notify_cache_invalidate(client_id, database, tbl)
+
     _clear_locks_for_client(client_id, database, table, pks)
 
     await send_msg(writer, {
@@ -498,20 +560,50 @@ async def handle_lock_release(msg: dict, writer: asyncio.StreamWriter):
         "pks":      pks,
     })
 
+    # Signal any waiting requester
     event_key = (database, table, "recall", client_id)
     if event_key in _lock_events:
         _lock_events[event_key].set()
 
 
-async def _notify_insert(inserter_id: str, database: str, table: str):
+async def handle_apply_changes(msg: dict, writer: asyncio.StreamWriter):
+    """
+    APPLY_CHANGES — receives a batch of SQL statements (from lazy inserts or
+    pre-flush) and applies them to the remote DB.
+    Source can be 'INSERT' or 'TYPE_C' or 'PRE_FLUSH'.
+    """
+    database = msg["database"]
+    changes  = msg.get("changes", [])
+    source   = msg.get("source", "UNKNOWN")
+
+    print(f"[remote] APPLY_CHANGES source={source} db={database} "
+          f"count={len(changes)}")
+
+    try:
+        apply_changes(database, changes)
+        # Invalidate caches for all affected tables
+        tables_affected = {ch.get("table", "") for ch in changes if ch.get("table")}
+        for tbl in tables_affected:
+            await _notify_cache_invalidate(None, database, tbl)
+        await send_msg(writer, {
+            "type":    "APPLY_ACK",
+            "database": database,
+            "count":   len(changes),
+        })
+    except Exception as e:
+        await send_msg(writer, {"type": "ERROR", "message": str(e)})
+
+
+async def _notify_cache_invalidate(sender_id: str | None, database: str, table: str):
+    """Tell all other cached clients that a table has been updated."""
     for cid, cache in client_cache_map.items():
-        if cid == inserter_id:
+        if cid == sender_id:
             continue
         if (database, table) in cache:
-            writer = clients.get(cid)
-            if writer:
+            w = clients.get(cid)
+            if w:
                 try:
-                    await send_msg(writer, {
+                    await send_msg(w, {
                         "type":     "CACHE_INVALIDATE",
                         "database": database,
                         "table":    table,
@@ -548,17 +640,25 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await handle_lock_request(msg, writer)
         elif msg_type == "LOCK_RELEASE":
             await handle_lock_release(msg, writer)
+        elif msg_type == "APPLY_CHANGES":
+            await handle_apply_changes(msg, writer)
         else:
             await send_msg(writer, {"type": "ERROR", "message": f"Unknown type: {msg_type}"})
 
+    # Cleanup on disconnect
     if client_id_seen:
         clients.pop(client_id_seen, None)
         subscriptions.pop(client_id_seen, None)
-        to_delete = [k for k, v in row_locks.items() if v.holder == client_id_seen]
-        for k in to_delete:
-            del row_locks[k]
+        # Release all locks held by this client
+        for key in list(row_locks.keys()):
+            entry = row_locks[key]
+            if entry.write == client_id_seen:
+                entry.write = None
+            entry.readers.discard(client_id_seen)
+            if entry.write is None and not entry.readers:
+                del row_locks[key]
         client_cache_map.pop(client_id_seen, None)
-
+    _writer_locks.pop(id(writer), None)
     writer.close()
 
 
