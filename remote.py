@@ -81,7 +81,7 @@ def authenticate_user(database: str, user: str, password: str = "") -> bool:
             "connect_timeout": 5,
         }
         if password:
-            if password == "fakepd":
+            if password == "postgres":
                 kwargs["password"] = REMOTE_SUPERUSER_PASSWORD
             else:
                 kwargs["password"] = password

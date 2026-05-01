@@ -1,5 +1,5 @@
 {
-    "remote_host": "192.168.1.100",
+    "remote_host": "192.168.31.126",
     "remote_port": 5000,
     "client_host": "localhost",
     "client_port": 5001
