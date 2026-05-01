@@ -36,7 +36,8 @@ else:
         "remote_superuser": "postgres",
         "remote_superuser_password": "postgres",
         "listen_host": "0.0.0.0",
-        "listen_port": 5000
+        "listen_port": 5000,
+        "query_delay_ms": 0
     }
     print("couldn't load config, so rewrote it")
     with open(CONFIG_FILE, "w") as f:
@@ -48,6 +49,7 @@ REMOTE_SUPERUSER          = config.get("remote_superuser", "postgres")
 REMOTE_SUPERUSER_PASSWORD = config.get("remote_superuser_password", "postgres")
 LISTEN_HOST               = config.get("listen_host", "0.0.0.0")
 LISTEN_PORT               = config.get("listen_port", 5000)
+QUERY_DELAY_MS            = config.get("query_delay_ms", 0)
 
 # ─── Global State ─────────────────────────────────────────────────────────────
 
@@ -359,6 +361,14 @@ def _collect_all_writers_for_table(client_id: str, database: str, table: str) ->
     return holders
 
 
+# ─── Simulated latency helper ────────────────────────────────────────────────
+
+async def _simulated_delay():
+    """Introduce artificial latency to simulate a slow/remote master DB."""
+    if QUERY_DELAY_MS > 0:
+        await asyncio.sleep(QUERY_DELAY_MS / 1000.0)
+
+
 # ─── Query execution ──────────────────────────────────────────────────────────
 
 def execute_query(database: str, sql: str) -> tuple[list[dict], list[str]]:
@@ -468,6 +478,7 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
             writers = _collect_all_writers_for_table(client_id, database, table)
             for holder, held_pks in writers.items():
                 await _recall_and_wait(holder, database, table, held_pks, client_id)
+        await _simulated_delay()
         try:
             rows, cols = execute_query(database, sql)
             await send_msg(writer, {
@@ -493,6 +504,7 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
             for holder, held_pks in all_writers.items():
                 await _recall_and_wait(holder, database, table, held_pks, client_id)
 
+        await _simulated_delay()
         try:
             rows, cols = execute_query(database, sql)
         except Exception as e:
@@ -711,6 +723,7 @@ async def handle_apply_changes(msg: dict, writer: asyncio.StreamWriter):
     print(f"[remote] APPLY_CHANGES source={source} db={database} "
           f"count={len(changes)}")
 
+    await _simulated_delay()
     ok = apply_changes(database, changes)
     if not ok:
         await send_msg(writer, {
