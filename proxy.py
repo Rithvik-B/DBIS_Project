@@ -481,6 +481,13 @@ async def do_select_type_b(parsed, remote_writer, client_writer):
     pks     = msg.get("pks", [])
     pk_cols = msg.get("pk_cols", [])
 
+    # Fix 3: skip caching if result is too large (> 10,000 rows)
+    CACHE_ROW_LIMIT = 10_000
+    if len(rows) > CACHE_ROW_LIMIT:
+        print(f"[proxy] Result has {len(rows)} rows (> {CACHE_ROW_LIMIT}) — not caching")
+        _print_table(rows, cols)
+        return
+
     await send_msg(client_writer, {
         "type":        "CACHE_ROWS",
         "database":    database,
@@ -591,6 +598,23 @@ async def do_write(parsed, remote_writer, client_writer):
     print(f"[proxy] (changes held locally; synced to remote on lock release)")
 
 
+# ─── Phase 2: META — psql backslash commands (→ remote, never cached) ──────────
+
+async def do_meta(parsed, remote_writer):
+    database = _session["database"]
+    print(f"[proxy] Meta command → remote")
+    await send_msg(remote_writer, {
+        "type":      "META_QUERY",
+        "client_id": CLIENT_ID,
+        "database":  database,
+        "meta_cmd":  parsed.raw,
+    })
+    msg = await _remote_q.get()
+    if msg["type"] == "ERROR":
+        print(f"[proxy] ERROR: {msg['message']}"); return
+    _print_table(msg.get("rows", []), msg.get("columns", []))
+
+
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 async def bootstrap(remote_writer, client_writer):
@@ -677,6 +701,11 @@ async def main():
                 if not _session["database"]:
                     print("[proxy] Not connected."); continue
                 await do_write(parsed, remote_writer, client_writer)
+
+            elif parsed.command_type == qmod.CommandType.META:
+                if not _session["database"]:
+                    print("[proxy] Not connected."); continue
+                await do_meta(parsed, remote_writer)
 
             elif parsed.command_type == qmod.CommandType.UNKNOWN:
                 print(f"[proxy] Unknown command.")

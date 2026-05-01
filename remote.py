@@ -527,6 +527,112 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
     await send_msg(writer, {"type": "ERROR", "message": f"Unknown query_type: {query_type}"})
 
 
+async def handle_meta_query(msg: dict, writer: asyncio.StreamWriter):
+    """Handle psql meta-commands by translating them to catalog SQL."""
+    database = msg["database"]
+    raw_cmd  = msg.get("meta_cmd", "").strip()
+    token    = raw_cmd.split()[0] if raw_cmd else ""
+    args     = raw_cmd[len(token):].strip() if len(raw_cmd) > len(token) else ""
+
+    print(f"[remote] META_QUERY: {raw_cmd} from db={database}")
+
+    # Map meta-commands to SQL
+    meta_sql_map = {
+        r"\dt": (
+            "SELECT schemaname AS \"Schema\", tablename AS \"Name\", "
+            "tableowner AS \"Owner\" FROM pg_tables "
+            "WHERE schemaname NOT IN ('pg_catalog', 'information_schema') "
+            "ORDER BY tablename;"
+        ),
+        r"\d": None,   # needs special handling — may have args
+        r"\l": (
+            "SELECT datname AS \"Name\", pg_catalog.pg_get_userbyid(datdba) AS \"Owner\", "
+            "pg_catalog.pg_encoding_to_char(encoding) AS \"Encoding\" "
+            "FROM pg_catalog.pg_database ORDER BY datname;"
+        ),
+        r"\du": (
+            "SELECT rolname AS \"Role name\", "
+            "CASE WHEN rolsuper THEN 'Superuser' ELSE '' END AS \"Attributes\" "
+            "FROM pg_catalog.pg_roles ORDER BY rolname;"
+        ),
+        r"\dn": (
+            "SELECT nspname AS \"Name\", pg_catalog.pg_get_userbyid(nspowner) AS \"Owner\" "
+            "FROM pg_catalog.pg_namespace "
+            "WHERE nspname NOT LIKE 'pg_%' AND nspname <> 'information_schema' "
+            "ORDER BY nspname;"
+        ),
+        r"\df": (
+            "SELECT routine_name AS \"Name\", routine_type AS \"Type\", "
+            "data_type AS \"Result data type\" "
+            "FROM information_schema.routines "
+            "WHERE routine_schema NOT IN ('pg_catalog', 'information_schema') "
+            "ORDER BY routine_name;"
+        ),
+        r"\dv": (
+            "SELECT schemaname AS \"Schema\", viewname AS \"Name\", "
+            "viewowner AS \"Owner\" FROM pg_views "
+            "WHERE schemaname NOT IN ('pg_catalog', 'information_schema') "
+            "ORDER BY viewname;"
+        ),
+        r"\di": (
+            "SELECT schemaname AS \"Schema\", indexname AS \"Name\", "
+            "tablename AS \"Table\" FROM pg_indexes "
+            "WHERE schemaname NOT IN ('pg_catalog', 'information_schema') "
+            "ORDER BY indexname;"
+        ),
+        r"\ds": (
+            "SELECT sequence_schema AS \"Schema\", sequence_name AS \"Name\" "
+            "FROM information_schema.sequences ORDER BY sequence_name;"
+        ),
+    }
+
+    # \d with args → describe table
+    if token == r"\d" and args:
+        tbl_name = args.strip('"').strip("'").strip()
+        sql = (
+            f"SELECT column_name AS \"Column\", data_type AS \"Type\", "
+            f"is_nullable AS \"Nullable\", column_default AS \"Default\" "
+            f"FROM information_schema.columns "
+            f"WHERE table_name = '{tbl_name}' "
+            f"AND table_schema = 'public' ORDER BY ordinal_position;"
+        )
+    elif token in meta_sql_map and meta_sql_map[token] is not None:
+        sql = meta_sql_map[token]
+    elif token == r"\d" and not args:
+        # \d without args → list all relations
+        sql = (
+            "SELECT schemaname AS \"Schema\", tablename AS \"Name\", "
+            "'table' AS \"Type\", tableowner AS \"Owner\" "
+            "FROM pg_tables "
+            "WHERE schemaname NOT IN ('pg_catalog', 'information_schema') "
+            "UNION ALL "
+            "SELECT schemaname, viewname, 'view', viewowner "
+            "FROM pg_views "
+            "WHERE schemaname NOT IN ('pg_catalog', 'information_schema') "
+            "UNION ALL "
+            "SELECT sequence_schema, sequence_name, 'sequence', NULL "
+            "FROM information_schema.sequences "
+            "ORDER BY 2;"
+        )
+    else:
+        await send_msg(writer, {
+            "type":    "ERROR",
+            "message": f"Unsupported meta command: {raw_cmd}",
+        })
+        return
+
+    try:
+        rows, cols = execute_query(database, sql)
+        await send_msg(writer, {
+            "type":     "META_RESULT",
+            "rows":     rows,
+            "columns":  cols,
+            "rowcount": len(rows),
+        })
+    except Exception as e:
+        await send_msg(writer, {"type": "ERROR", "message": str(e)})
+
+
 async def handle_lock_request(msg: dict, writer: asyncio.StreamWriter):
     """Grant an exclusive WRITE lock after recalling ALL current holders."""
     client_id = msg["client_id"]
@@ -665,6 +771,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await handle_lock_release(msg, writer)
         elif msg_type == "APPLY_CHANGES":
             await handle_apply_changes(msg, writer)
+        elif msg_type == "META_QUERY":
+            await handle_meta_query(msg, writer)
         else:
             await send_msg(writer, {"type": "ERROR", "message": f"Unknown type: {msg_type}"})
 

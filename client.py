@@ -77,10 +77,6 @@ _in_flight_flush: dict = {}
 # key: database → list of insert entries in-flight
 _in_flight_inserts: dict = {}
 
-# Entries being flushed via FLUSH_PENDING (in-flight, not yet confirmed done)
-# key: (database, table) → {inserts: list, type_c: list}
-_in_flight_flush: dict = {}
-
 
 # ─── Low-level DB helpers ─────────────────────────────────────────────────────
 
@@ -429,19 +425,88 @@ def confirm_inserts_done(database: str):
             pass
 
 
+def purge_cached_rows(database: str, table: str, pks: list | None = None,
+                      pk_cols: list | None = None):
+    """
+    Physically DELETE rows from the local Postgres table and clear all
+    in-memory tracking (cache index, locks, query_cache) for them.
+
+    If `pks` is None, the entire table is truncated.
+    If `pk_cols` is given, rows are deleted by PK; otherwise the whole table
+    is truncated as a safe fallback.
+    """
+    conn = get_superuser_conn(database=database)
+    conn.autocommit = False
+    cur = conn.cursor()
+    try:
+        if pks is None or pk_cols is None:
+            # Full table purge
+            cur.execute(f'DELETE FROM "{table}";')
+            deleted = cur.rowcount
+        else:
+            deleted = 0
+            for pk_val in pks:
+                if len(pk_cols) == 1:
+                    cur.execute(
+                        f'DELETE FROM "{table}" WHERE "{pk_cols[0]}" = %s;',
+                        (pk_val,),
+                    )
+                else:
+                    # composite PK — pk_val is a JSON list
+                    import ast
+                    vals = ast.literal_eval(pk_val) if isinstance(pk_val, str) else pk_val
+                    where_parts = [f'"{col}" = %s' for col in pk_cols]
+                    cur.execute(
+                        f'DELETE FROM "{table}" WHERE ' + ' AND '.join(where_parts) + ';',
+                        tuple(vals),
+                    )
+                deleted += cur.rowcount
+        conn.commit()
+        print(f"[client] Purged {deleted} cached row(s) from '{table}'")
+    except Exception as e:
+        conn.rollback()
+        print(f"[client] Error purging rows from '{table}': {e}")
+    finally:
+        cur.close()
+        conn.close()
+
+    # Clear in-memory tracking
+    if pks is not None:
+        cache_set = local_cache_index.get((database, table), set())
+        for pk in pks:
+            cache_set.discard(str(pk))
+            local_locks.pop((database, table, str(pk)), None)
+        if not cache_set:
+            local_cache_index.pop((database, table), None)
+    else:
+        local_cache_index.pop((database, table), None)
+        # Remove all locks for this table
+        to_remove = [k for k in local_locks if k[0] == database and k[1] == table]
+        for k in to_remove:
+            del local_locks[k]
+
+    # Invalidate query_cache entries referencing this table
+    to_del = [fp for fp, v in query_cache.items()
+              if v["database"] == database and v["table"] == table]
+    for fp in to_del:
+        del query_cache[fp]
+
+
 def flush_pending_for_recall(database: str, table: str, pks: list) -> list[dict]:
     """Used when remote RECALL_LOCK arrives (via proxy). Returns type-C changes."""
     relevant = [c for c in pending_changes
                 if c["database"] == database and c["table"] == table]
     for c in relevant:
         pending_changes.remove(c)
-    for pk in pks:
-        local_locks.pop((database, table, str(pk)), None)
-    local_cache_index.pop((database, table), None)
-    to_del = [fp for fp, v in query_cache.items()
-              if v["database"] == database and v["table"] == table]
-    for fp in to_del:
-        del query_cache[fp]
+
+    # Look up PK columns from schema so we can do targeted deletes
+    schema = schema_registry.get(database, {})
+    tbl_schema = schema.get(table, {})
+    pk_cols = tbl_schema.get("primary_keys", None)
+
+    # Purge the recalled rows from the local database
+    purge_cached_rows(database, table, pks, pk_cols)
+
     return relevant
 
 
@@ -646,11 +711,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         elif msg_type == "CACHE_INVALIDATE":
             database = msg["database"]
             table    = msg["table"]
-            local_cache_index.pop((database, table), None)
-            to_del = [fp for fp, v in query_cache.items()
-                      if v["database"] == database and v["table"] == table]
-            for fp in to_del:
-                del query_cache[fp]
+            # Purge actual rows from local DB so stale data can't be served
+            purge_cached_rows(database, table)
             print(f"[client] Cache invalidated for {database}.{table}")
             await send_msg(writer, {"type": "CACHE_INVALIDATE_ACK", "table": table})
 

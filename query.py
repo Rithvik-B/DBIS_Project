@@ -28,6 +28,7 @@ class CommandType(Enum):
     INSERT   = auto()
     UPDATE   = auto()
     DELETE   = auto()
+    META     = auto()   # psql meta-commands (\dt, \l, etc.)
     UNKNOWN  = auto()
 
 class RouteType(Enum):
@@ -36,6 +37,7 @@ class RouteType(Enum):
     TYPE_C   = auto()   # write → lock + local apply + deferred sync on lock release
     INSERT   = auto()   # lazy write → local first, background sync to remote
     CONNECT  = auto()
+    META     = auto()   # psql meta-commands → remote, never cached
     UNKNOWN  = auto()
 
 
@@ -95,6 +97,20 @@ _INSERT_RE = re.compile(
     r'^\s*INSERT\s+INTO\s+' + _TABLE_PAT + r'(?=\s|\(|;|$)',
     re.IGNORECASE,
 )
+
+
+# ─── psql meta-commands ───────────────────────────────────────────────────────
+
+PSQL_META_COMMANDS = {
+    r"\dt", r"\d", r"\l", r"\c", r"\du", r"\dn",
+    r"\df", r"\dv", r"\di", r"\ds", r"\copy",
+    r"\q", r"\?", r"\h",
+}
+
+def is_valid_psql_meta(cmd: str) -> bool:
+    """Check if the command starts with a known psql backslash meta-command."""
+    token = cmd.strip().split()[0] if cmd.strip() else ""
+    return token in PSQL_META_COMMANDS
 
 
 def _unquote(name: str) -> str:
@@ -216,5 +232,13 @@ def parse(raw: str) -> ParsedCommand:
                 fingerprint  = _fingerprint(table, where_text),
             )
         return ParsedCommand(CommandType.DELETE, RouteType.TYPE_C, raw)
+
+    # ── psql meta-commands (\dt, \l, etc.) ────────────────────────────────────
+    if is_valid_psql_meta(stripped):
+        return ParsedCommand(
+            command_type = CommandType.META,
+            route_type   = RouteType.META,
+            raw          = raw,
+        )
 
     return ParsedCommand(CommandType.UNKNOWN, RouteType.UNKNOWN, raw)
