@@ -376,33 +376,85 @@ def flush_pending_for_tables(database: str, tables: list) -> dict:
     }
 
 
-def confirm_flush_done(database: str, tables: list):
-    """Called after proxy confirms changes were applied to remote."""
+def confirm_flush_done(database: str, tables: list,
+                       recalled_pks_by_table: dict | None = None):
+    """
+    Called after proxy confirms changes (type-C writes + inserts) were applied
+    to remote.  We must:
+      1. Remove entries from pending_inserts / pending_changes.
+      2. Physically DELETE the now-stale rows from the local Postgres replica.
+
+    recalled_pks_by_table: {table: [pk, ...]} — PKs being recalled from a READ
+    or WRITE lock recall, in addition to any type-C written PKs.
+    """
+    recalled = recalled_pks_by_table or {}
     for tbl in tables:
         key = (database, tbl)
         flight = _in_flight_flush.pop(key, None)
         if flight is None:
+            # Could be a pure read-lock recall with no pending changes.
+            # Still need to purge the recalled PKs.
+            if tbl in recalled:
+                schema  = schema_registry.get(database, {})
+                pk_cols = schema.get(tbl, {}).get("primary_keys", None)
+                purge_cached_rows(database, tbl, recalled[tbl], pk_cols)
             continue
+
+        # Collect all PKs that were written (type-C) so we can purge them
+        written_pks: list = list(recalled.get(tbl, []))
+        schema     = schema_registry.get(database, {})
+        pk_cols    = schema.get(tbl, {}).get("primary_keys", None)
+
         # Remove from pending_inserts
         for e in flight["inserts"]:
             try:
                 pending_inserts.remove(e)
             except ValueError:
                 pass
-        # Remove from pending_changes and clear locks
+
+        # Remove from pending_changes and collect the written PKs
         for e in flight["type_c"]:
             try:
                 pending_changes.remove(e)
             except ValueError:
                 pass
-            for pk in e.get("pks", []):
-                local_locks.pop((database, tbl, str(pk)), None)
-        # Invalidate local cache for the table
-        local_cache_index.pop((database, tbl), None)
-        to_del = [fp for fp, v in query_cache.items()
-                  if v["database"] == database and v["table"] == tbl]
-        for fp in to_del:
-            del query_cache[fp]
+            written_pks.extend(str(pk) for pk in e.get("pks", []))
+
+        # Physically purge the affected rows from the local replica.
+        if written_pks and pk_cols:
+            purge_cached_rows(database, tbl, written_pks, pk_cols)
+        else:
+            # No PK info or no specific PKs — purge the whole table to be safe
+            purge_cached_rows(database, tbl)
+
+
+def cleanup_session(database: str):
+    """
+    Called when the proxy disconnects (user types 'quit').
+    Purges ALL rows fetched through this connection from the local Postgres
+    replica so no stale data survives between sessions.
+    """
+    schema = schema_registry.get(database, {})
+    if not schema:
+        print(f"[client] No schema found for '{database}' — nothing to clean up.")
+        return
+    for tbl in schema:
+        purge_cached_rows(database, tbl)
+    # Also clear pending state
+    pending_inserts[:] = [e for e in pending_inserts if e["database"] != database]
+    pending_changes[:] = [e for e in pending_changes if e["database"] != database]
+    _in_flight_flush.clear()
+    _in_flight_inserts.pop(database, None)
+    schema_registry.pop(database, None)
+    # Clear in-memory cache entries for this database
+    for k in [k for k in local_cache_index if k[0] == database]:
+        del local_cache_index[k]
+    for k in [k for k in local_locks if k[0] == database]:
+        del local_locks[k]
+    fps = [fp for fp, v in query_cache.items() if v.get("database") == database]
+    for fp in fps:
+        del query_cache[fp]
+    print(f"[client] Session cleanup complete for '{database}'.")
 
 
 def collect_inserts_for_flush(database: str) -> list[dict]:
@@ -662,9 +714,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         # ── Phase 2: proxy confirms changes reached remote ────────────────────
         elif msg_type == "FLUSH_DONE":
             try:
-                database = msg["database"]
-                tables   = msg.get("tables", [])
-                confirm_flush_done(database, tables)
+                database              = msg["database"]
+                tables                = msg.get("tables", [])
+                recalled_pks_by_table = msg.get("recalled_pks_by_table", {})
+                confirm_flush_done(database, tables, recalled_pks_by_table)
                 await send_msg(writer, {"type": "FLUSH_DONE_ACK", "tables": tables})
             except Exception as e:
                 await send_msg(writer, {"type": "ERROR", "message": str(e)})
@@ -707,14 +760,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             except Exception as e:
                 await send_msg(writer, {"type": "ERROR", "message": str(e)})
 
-        # ── Phase 2: cache invalidation ───────────────────────────────────────
+        # ── Phase 2: cache invalidation (fire-and-forget push, no ack sent) ──
         elif msg_type == "CACHE_INVALIDATE":
             database = msg["database"]
             table    = msg["table"]
             # Purge actual rows from local DB so stale data can't be served
             purge_cached_rows(database, table)
             print(f"[client] Cache invalidated for {database}.{table}")
-            await send_msg(writer, {"type": "CACHE_INVALIDATE_ACK", "table": table})
+
+        # ── Session cleanup (proxy is disconnecting) ──────────────────────────
+        elif msg_type == "DISCONNECT":
+            database = msg.get("database", "")
+            if database:
+                cleanup_session(database)
+            await send_msg(writer, {"type": "DISCONNECT_ACK"})
 
         else:
             await send_msg(writer, {

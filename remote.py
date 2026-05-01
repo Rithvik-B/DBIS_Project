@@ -483,6 +483,16 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
 
     # ── Type B: cacheable read ─────────────────────────────────────────────────
     if query_type == "B":
+        # Before executing the query, recall ALL write-lock holders on this table.
+        # This is necessary because an unflushed write might affect which rows
+        # match the WHERE clause (e.g. name changed Alice→Bob, then someone queries
+        # WHERE name='Bob').  We must flush all dirty writes first so the result
+        # is consistent.
+        if table:
+            all_writers = _collect_all_writers_for_table(client_id, database, table)
+            for holder, held_pks in all_writers.items():
+                await _recall_and_wait(holder, database, table, held_pks, client_id)
+
         try:
             rows, cols = execute_query(database, sql)
         except Exception as e:
@@ -499,12 +509,7 @@ async def handle_query(msg: dict, writer: asyncio.StreamWriter):
             else:
                 pks.append(json.dumps([str(row[c]) for c in pk_cols]))
 
-        # Recall any WRITE holders before granting READ (readers may coexist)
-        writers_to_recall = _collect_writers_for_read(client_id, database, table, pks)
-        for holder, held_pks in writers_to_recall.items():
-            await _recall_and_wait(holder, database, table, held_pks, client_id)
-
-        # Grant READ: add requester to readers set; do NOT disturb existing readers
+        # Grant READ: add requester to readers set; existing readers are untouched
         for pk in pks:
             entry = _get_or_create_lock(database, table, pk)
             entry.readers.add(client_id)

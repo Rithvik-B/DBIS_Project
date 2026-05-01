@@ -75,8 +75,17 @@ _session: dict = {
 _remote_q: asyncio.Queue = None   # set in main()
 _client_q: asyncio.Queue = None
 
-# Single operation lock — prevents command loop and recall handler overlapping
+# Serialises the command-processing coroutine and background insert flush
 _op_lock: asyncio.Lock = None
+
+# Dedicated queues used ONLY by _handle_recall_lock (decoupled from command loop)
+# This prevents the deadlock where the recall handler and command loop both
+# wait on the same queues while competing for _op_lock.
+_recall_client_q: asyncio.Queue = None   # FLUSH_ACK / FLUSH_DONE_ACK for recall
+_recall_remote_q: asyncio.Queue = None   # SYNC_ACK for recall
+
+# Set to True while a recall is being handled; reader tasks route responses here
+_recall_active: bool = False
 
 
 # ─── Message I/O ──────────────────────────────────────────────────────────────
@@ -122,8 +131,9 @@ async def _remote_reader_task(remote_reader: asyncio.StreamReader,
                                client_writer: asyncio.StreamWriter):
     """
     Continuously drain remote_reader.
-    RECALL_LOCK → spawn _handle_recall_lock as a task.
+    RECALL_LOCK  → spawn _handle_recall_lock as a task.
     CACHE_INVALIDATE → forward to client silently.
+    SYNC_ACK while recall active → route to _recall_remote_q.
     Everything else → put in _remote_q for the command loop.
     """
     while True:
@@ -136,28 +146,38 @@ async def _remote_reader_task(remote_reader: asyncio.StreamReader,
                 _handle_recall_lock(msg, remote_writer, client_writer)
             )
         elif mtype == "CACHE_INVALIDATE":
-            # Forward to client so it drops the stale cache entry
             asyncio.create_task(
                 _forward_cache_invalidate(msg, client_writer)
             )
+        elif mtype == "SYNC_ACK" and _recall_active:
+            await _recall_remote_q.put(msg)
         else:
             await _remote_q.put(msg)
 
 
 async def _client_reader_task(client_reader: asyncio.StreamReader):
-    """Continuously drain client_reader → put in _client_q for the command loop."""
+    """
+    Continuously drain client_reader.
+    FLUSH_ACK / FLUSH_DONE_ACK while recall active → route to _recall_client_q.
+    Everything else → put in _client_q for the command loop.
+    """
     while True:
         msg = await recv_msg(client_reader)
         if msg is None:
             break
-        await _client_q.put(msg)
+        mtype = msg.get("type", "")
+        if _recall_active and mtype in ("FLUSH_ACK", "FLUSH_DONE_ACK"):
+            await _recall_client_q.put(msg)
+        else:
+            await _client_q.put(msg)
 
 
 async def _forward_cache_invalidate(msg: dict, client_writer: asyncio.StreamWriter):
+    """Forward CACHE_INVALIDATE to client; consume the ack without blocking callers."""
     try:
         await send_msg(client_writer, msg)
-        # consume the ack (we don't care about it)
-        await asyncio.wait_for(_client_q.get(), timeout=5.0)
+        # Don't consume from any queue — the ack will arrive on _client_q and be
+        # silently dropped as an unrecognised message type in the REPL loop.
     except Exception:
         pass
 
@@ -230,32 +250,35 @@ async def _background_insert_flush(remote_writer: asyncio.StreamWriter,
 
 
 # ─── RECALL_LOCK handler (runs as a background task) ─────────────────────────
+# Uses its own dedicated queues (_recall_client_q / _recall_remote_q) so it
+# NEVER competes with the command loop for _op_lock or _client_q/_remote_q.
+# The reader tasks route FLUSH_ACK, FLUSH_DONE_ACK, and SYNC_ACK here while
+# _recall_active is True.
 
 async def _handle_recall_lock(msg: dict, remote_writer: asyncio.StreamWriter,
                                client_writer: asyncio.StreamWriter):
-    """
-    Remote is recalling our WRITE lock.  Under _op_lock:
-      1. Ask client for pending type-C changes for the table.
-      2. Send LOCK_RELEASE (with changes) to remote.
-      3. Confirm to client that flush is done.
-      4. Update session's active_locks.
-    """
+    global _recall_active
     database = msg["database"]
     table    = msg["table"]
     pks      = msg["pks"]
     print(f"\n[proxy] ← RECALL_LOCK: {table} PKs={pks} — flushing & releasing …")
 
-    async with _op_lock:
-        # Step 1: flush pending changes from client
+    _recall_active = True
+    try:
+        # Step 1: ask client for pending type-C changes for this table
         await send_msg(client_writer, {
             "type":     "FLUSH_PENDING",
             "database": database,
             "tables":   [table],
         })
-        flush_ack = await asyncio.wait_for(_client_q.get(), timeout=10.0)
+        try:
+            flush_ack = await asyncio.wait_for(_recall_client_q.get(), timeout=10.0)
+        except asyncio.TimeoutError:
+            print("[proxy] RECALL: timeout waiting for FLUSH_ACK from client")
+            return
         type_c_changes = flush_ack.get("type_c_changes", [])
 
-        # Step 2: release lock on remote with the changes
+        # Step 2: release the lock on remote, sending the pending changes
         await send_msg(remote_writer, {
             "type":            "LOCK_RELEASE",
             "client_id":       CLIENT_ID,
@@ -264,17 +287,30 @@ async def _handle_recall_lock(msg: dict, remote_writer: asyncio.StreamWriter,
             "pks":             pks,
             "pending_changes": type_c_changes,
         })
-        sync_ack = await asyncio.wait_for(_remote_q.get(), timeout=10.0)
+        try:
+            sync_ack = await asyncio.wait_for(_recall_remote_q.get(), timeout=10.0)
+            if not sync_ack.get("success", True):
+                print(f"[proxy] RECALL: remote reported apply failure for '{table}'")
+        except asyncio.TimeoutError:
+            print("[proxy] RECALL: timeout waiting for SYNC_ACK from remote")
+            return
 
-        # Step 3: tell client to finalise the flush
+        # Step 3: confirm to client so it can clear its pending_changes & purge rows
+        # Pass the recalled PKs so client deletes exactly those rows, not the whole table.
         await send_msg(client_writer, {
-            "type":     "FLUSH_DONE",
-            "database": database,
-            "tables":   [table],
+            "type":                  "FLUSH_DONE",
+            "database":              database,
+            "tables":                [table],
+            "recalled_pks_by_table": {table: pks},
         })
-        await asyncio.wait_for(_client_q.get(), timeout=5.0)
+        try:
+            await asyncio.wait_for(_recall_client_q.get(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass  # non-fatal
 
-    # Update session
+    finally:
+        _recall_active = False
+
     _session["active_locks"].pop(table, None)
     print(f"[proxy] ✓ Lock for '{table}' released to remote requester")
 
@@ -390,11 +426,12 @@ async def _pre_flush(database: str, tables: list,
         await _remote_q.get()   # consume SYNC_ACK
         _session["active_locks"].pop(tbl, None)
 
-    # Confirm to client that the entries can be permanently removed
+    # Confirm to client: pass the written PKs so it purges only those rows.
     await send_msg(client_writer, {
-        "type":     "FLUSH_DONE",
-        "database": database,
-        "tables":   tables,
+        "type":                  "FLUSH_DONE",
+        "database":              database,
+        "tables":                tables,
+        "recalled_pks_by_table": write_pks_by_tbl,
     })
     await _client_q.get()   # consume FLUSH_DONE_ACK
     return True
@@ -615,6 +652,75 @@ async def do_meta(parsed, remote_writer):
     _print_table(msg.get("rows", []), msg.get("columns", []))
 
 
+# ─── Phase 2: QUIT — release locks, clean local DB, disconnect ─────────────────────
+
+async def do_quit(remote_writer: asyncio.StreamWriter,
+                  client_writer: asyncio.StreamWriter):
+    """
+    Clean shutdown:
+    1. Release all held write locks to remote (flush changes first).
+    2. Tell client to purge all locally fetched data.
+    3. Return so the REPL loop can break.
+    """
+    database = _session.get("database")
+
+    async with _op_lock:
+        # Flush + release every active write lock
+        for table, pks in list(_session["active_locks"].items()):
+            print(f"[proxy] Releasing write lock on '{table}' before quit …")
+            await send_msg(client_writer, {
+                "type":     "FLUSH_PENDING",
+                "database": database,
+                "tables":   [table],
+            })
+            try:
+                flush_ack = await asyncio.wait_for(_client_q.get(), timeout=10.0)
+            except asyncio.TimeoutError:
+                print(f"[proxy] Timeout flushing '{table}' on quit")
+                continue
+            type_c_changes = flush_ack.get("type_c_changes", [])
+            write_pks_by_tbl = flush_ack.get("write_pks_by_table", {})
+
+            await send_msg(remote_writer, {
+                "type":            "LOCK_RELEASE",
+                "client_id":       CLIENT_ID,
+                "database":        database,
+                "table":           table,
+                "pks":             pks,
+                "pending_changes": type_c_changes,
+            })
+            try:
+                await asyncio.wait_for(_remote_q.get(), timeout=10.0)  # SYNC_ACK
+            except asyncio.TimeoutError:
+                print(f"[proxy] Timeout releasing lock on '{table}' on quit")
+
+            await send_msg(client_writer, {
+                "type":                  "FLUSH_DONE",
+                "database":              database,
+                "tables":                [table],
+                "recalled_pks_by_table": {table: pks},
+            })
+            try:
+                await asyncio.wait_for(_client_q.get(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            _session["active_locks"].pop(table, None)
+
+        # Tell client to wipe all locally fetched data for this session
+        if database:
+            await send_msg(client_writer, {
+                "type":     "DISCONNECT",
+                "database": database,
+            })
+            try:
+                ack = await asyncio.wait_for(_client_q.get(), timeout=10.0)
+                if ack.get("type") == "DISCONNECT_ACK":
+                    print(f"[proxy] Local replica for '{database}' cleaned up.")
+            except asyncio.TimeoutError:
+                print("[proxy] Timeout waiting for DISCONNECT_ACK from client")
+
+    print("[proxy] Goodbye.")
+
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 async def bootstrap(remote_writer, client_writer):
@@ -638,10 +744,12 @@ async def bootstrap(remote_writer, client_writer):
 # ─── Main REPL ────────────────────────────────────────────────────────────────
 
 async def main():
-    global _remote_q, _client_q, _op_lock
-    _remote_q = asyncio.Queue()
-    _client_q = asyncio.Queue()
-    _op_lock  = asyncio.Lock()
+    global _remote_q, _client_q, _op_lock, _recall_client_q, _recall_remote_q
+    _remote_q        = asyncio.Queue()
+    _client_q        = asyncio.Queue()
+    _op_lock         = asyncio.Lock()
+    _recall_client_q = asyncio.Queue()
+    _recall_remote_q = asyncio.Queue()
 
     print(f"[proxy] Connecting to remote.py at {REMOTE_HOST}:{REMOTE_PORT} …")
     remote_reader, remote_writer = await asyncio.open_connection(REMOTE_HOST, REMOTE_PORT)
@@ -673,7 +781,7 @@ async def main():
         if not raw:
             continue
         if raw.lower() in ("exit", "quit", r"\q"):
-            print("[proxy] Goodbye.")
+            await do_quit(remote_writer, client_writer)
             break
 
         parsed = qmod.parse(raw)
