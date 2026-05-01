@@ -68,30 +68,42 @@ _GROUP_BY_RE   = re.compile(r'\bGROUP\s+BY\b', re.IGNORECASE)
 _ORDER_BY_RE   = re.compile(r'\bORDER\s+BY\b', re.IGNORECASE)
 _WHERE_EQ_RE   = re.compile(r'\bWHERE\b.+\b\w+\s*=\s*[^\s<>!]', re.IGNORECASE | re.DOTALL)
 
+# Matches a bare or double-quoted identifier, with an optional schema prefix.
+# Examples: employees, "employees", public.employees, "public"."employees"
+_IDENT     = r'(?:"[^"]*"|\w+)'
+_TABLE_PAT = r'(?:' + _IDENT + r'\.)?(' + _IDENT + r')'   # group captures table (last) part
+
 # Extract table name from simple single-table SELECT
-# SELECT ... FROM <table> [WHERE ...] [;]
+# SELECT ... FROM [schema.]<table> [WHERE ...] [;]
 _SELECT_FROM_RE = re.compile(
-    r'^\s*SELECT\s+.+?\s+FROM\s+(\w+)\s*(?:WHERE\s+(.+?))?\s*;?\s*$',
+    r'^\s*SELECT\s+.+?\s+FROM\s+' + _TABLE_PAT + r'\s*(?:WHERE\s+(.+?))?\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract table name from UPDATE <table> SET ... WHERE ...
+# Extract table name from UPDATE [schema.]<table> SET ... WHERE ...
 _UPDATE_RE = re.compile(
-    r'^\s*UPDATE\s+(\w+)\s+SET\s+.+?\s+WHERE\s+(.+?)\s*;?\s*$',
+    r'^\s*UPDATE\s+' + _TABLE_PAT + r'\s+SET\s+.+?\s+WHERE\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract table name from DELETE FROM <table> WHERE ...
+# Extract table name from DELETE FROM [schema.]<table> WHERE ...
 _DELETE_RE = re.compile(
-    r'^\s*DELETE\s+FROM\s+(\w+)\s+WHERE\s+(.+?)\s*;?\s*$',
+    r'^\s*DELETE\s+FROM\s+' + _TABLE_PAT + r'\s+WHERE\s+(.+?)\s*;?\s*$',
     re.IGNORECASE | re.DOTALL,
 )
 
-# Extract table name from INSERT INTO <table> ...
+# Extract table name from INSERT INTO [schema.]<table> ...
 _INSERT_RE = re.compile(
-    r'^\s*INSERT\s+INTO\s+(\w+)\b',
+    r'^\s*INSERT\s+INTO\s+' + _TABLE_PAT + r'(?=\s|\(|;|$)',
     re.IGNORECASE,
 )
+
+
+def _unquote(name: str) -> str:
+    """Strip surrounding double-quotes from an identifier."""
+    if name.startswith('"') and name.endswith('"'):
+        return name[1:-1]
+    return name
 
 
 def _fingerprint(table: str, where: str) -> str:
@@ -145,7 +157,7 @@ def parse(raw: str) -> ParsedCommand:
         # Try to parse as Type B
         m = _SELECT_FROM_RE.match(stripped)
         if m:
-            table       = m.group(1)
+            table       = _unquote(m.group(1))
             where_text  = (m.group(2) or "").strip()
             if where_text and _WHERE_EQ_RE.search("WHERE " + where_text):
                 return ParsedCommand(
@@ -166,7 +178,7 @@ def parse(raw: str) -> ParsedCommand:
     # ── INSERT — always remote ────────────────────────────────────────────────
     if upper.startswith("INSERT"):
         m = _INSERT_RE.match(stripped)
-        table = m.group(1) if m else ""
+        table = _unquote(m.group(1)) if m else ""
         return ParsedCommand(
             command_type = CommandType.INSERT,
             route_type   = RouteType.INSERT,
@@ -178,7 +190,7 @@ def parse(raw: str) -> ParsedCommand:
     if upper.startswith("UPDATE"):
         m = _UPDATE_RE.match(stripped)
         if m:
-            table, where_text = m.group(1), m.group(2).strip()
+            table, where_text = _unquote(m.group(1)), m.group(2).strip()
             return ParsedCommand(
                 command_type = CommandType.UPDATE,
                 route_type   = RouteType.TYPE_C,
@@ -193,7 +205,7 @@ def parse(raw: str) -> ParsedCommand:
     if upper.startswith("DELETE"):
         m = _DELETE_RE.match(stripped)
         if m:
-            table, where_text = m.group(1), m.group(2).strip()
+            table, where_text = _unquote(m.group(1)), m.group(2).strip()
             return ParsedCommand(
                 command_type = CommandType.DELETE,
                 route_type   = RouteType.TYPE_C,

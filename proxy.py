@@ -414,6 +414,8 @@ async def main():
         elif parsed.command_type == qmod.CommandType.SELECT:
             if not _session["database"]:
                 print("[proxy] Not connected. Use CONNECT first."); continue
+            print(f"[proxy] Classified as {parsed.route_type.name} "
+                  f"| table={repr(parsed.table)} | where={repr(parsed.where_clause)}")
             if parsed.route_type == qmod.RouteType.TYPE_B:
                 await do_select_type_b(parsed, remote_reader, remote_writer,
                                        client_reader, client_writer)
